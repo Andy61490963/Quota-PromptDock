@@ -15,13 +15,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, QPoint, QRect, QRectF, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPen
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -35,15 +36,18 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
+from prompt_tools import PasteController, PromptPanel, PromptStore
 
 
-APP_NAME = "QuotaDock"
-APP_VERSION = "1.2.6"
-APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CodexUsageWidget"
+APP_NAME = "Quota PromptDock"
+APP_VERSION = "1.3.1"
+TAIWAN_TZ = timezone(timedelta(hours=8))
+APP_DIR = Path(os.environ.get("QUOTA_PROMPTDOCK_DATA_DIR", str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CodexUsageWidget")))
 STATE_PATH = APP_DIR / "usage_state.json"
 CLAUDE_STATE_PATH = APP_DIR / "claude_usage_state.json"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -148,7 +152,7 @@ def clamped_position(point: QPoint, size: QSize, area: QRect) -> QPoint:
     )
 
 
-GITHUB_REPO = "and910805/QuotaDock"
+GITHUB_REPO = "Andy61490963/Quota-PromptDock"
 RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASE_DOWNLOAD_PREFIX = f"https://github.com/{GITHUB_REPO}/releases/download/"
 RELEASE_ASSET = "QuotaDock-Windows-x64.exe"
@@ -193,6 +197,7 @@ class UsageSnapshot:
     reset_credits: int
     reached_type: str | None
     fetched_at: int
+    other_limits: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_response(cls, response: dict[str, Any]) -> "UsageSnapshot":
@@ -200,13 +205,16 @@ class UsageSnapshot:
         snapshot = result.get("rateLimits") or {}
         buckets = result.get("rateLimitsByLimitId") or {}
         if buckets:
-            snapshot = buckets.get("codex") or next(iter(buckets.values()))
+            snapshot = buckets.get("codex") or {}
 
         def parse_window(value: Any) -> UsageWindow | None:
             if not isinstance(value, dict):
                 return None
+            used = value.get("usedPercent")
+            if not isinstance(used, (int, float)) or isinstance(used, bool) or not math.isfinite(used):
+                return None
             return UsageWindow(
-                used_percent=float(value.get("usedPercent", 0.0)),
+                used_percent=max(0.0, min(100.0, float(used))),
                 duration_minutes=_optional_int(value.get("windowDurationMins")),
                 resets_at=_optional_int(value.get("resetsAt")),
             )
@@ -225,6 +233,7 @@ class UsageSnapshot:
             reset_credits=int(reset_credits.get("availableCount", 0) or 0),
             reached_type=snapshot.get("rateLimitReachedType"),
             fetched_at=int(time.time()),
+            other_limits={key: value for key, value in buckets.items() if key != "codex" and isinstance(value, dict)},
         )
 
 
@@ -351,7 +360,7 @@ def mini_remaining(
     source: str,
     codex: UsageSnapshot | None,
     claude: "ClaudeUsageSnapshot | None",
-) -> float:
+) -> float | None:
     """懸浮圖示要顯示的剩餘百分比；指定來源沒資料時退回看得到的那邊。"""
 
     def codex_values() -> list[float]:
@@ -376,7 +385,7 @@ def mini_remaining(
         values = claude_values() or codex_values()
     else:
         values = codex_values() + claude_values()
-    return min(values) if values else 0.0
+    return min(values) if values else None
 
 
 def detect_window_reset(previous: UsageWindow | None, current: UsageWindow | None) -> bool:
@@ -434,7 +443,7 @@ def reset_time_label(timestamp: int | None, now: int | None = None) -> str:
     days, remainder = divmod(remaining, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
-    reset_clock = datetime.fromtimestamp(timestamp).strftime("%m/%d %H:%M")
+    reset_clock = datetime.fromtimestamp(timestamp, TAIWAN_TZ).strftime("%m/%d %H:%M")
     if days:
         countdown = f"{days} 天 {hours} 小時"
     elif hours:
@@ -461,6 +470,16 @@ class CodexCliLocator:
         development_copy = Path(__file__).resolve().parent.parent / "codex-local.exe"
         if development_copy.is_file() and not getattr(sys, "frozen", False):
             return development_copy
+
+        # 新版桌面程式的 CLI 與相依程序放在使用者目錄，應直接執行完整目錄中的版本。
+        desktop_bin = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "OpenAI" / "Codex" / "bin"
+        if desktop_bin.is_dir():
+            candidates = list(desktop_bin.glob("*/codex.exe"))
+            if candidates:
+                return max(candidates, key=lambda path: path.stat().st_mtime)
+        on_path = shutil.which("codex.exe")
+        if on_path:
+            return Path(on_path)
 
         version, install_location = self._installed_package()
         source = install_location / "app" / "resources" / "codex.exe"
@@ -506,7 +525,7 @@ class CodexUsageClient:
     def fetch(self) -> UsageSnapshot:
         cli = self.locator.locate()
         process = subprocess.Popen(
-            [str(cli), "app-server", "--stdio"],
+            [str(cli), "app-server", "--listen", "stdio://"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -524,6 +543,12 @@ class CodexUsageClient:
                 messages.put(line)
 
         threading.Thread(target=read_stdout, daemon=True).start()
+        # 不保存可能含環境資訊的診斷輸出，只持續排空，避免管線塞滿。
+        def drain_stderr() -> None:
+            if process.stderr:
+                for _ in process.stderr:
+                    pass
+        threading.Thread(target=drain_stderr, daemon=True).start()
 
         def send(payload: dict[str, Any]) -> None:
             if process.stdin is None:
@@ -572,7 +597,9 @@ class CodexUsageClient:
                 elif message.get("id") == 2:
                     if "error" in message:
                         detail = message.get("error", {}).get("message", "用量服務暫時無法使用")
-                        raise RuntimeError(str(detail))
+                        if any(word in str(detail).lower() for word in ("not logged", "unauthorized", "authentication", "requires chatgpt")):
+                            raise RuntimeError("Codex 尚未登入，請開啟 Codex 完成登入後再按立即更新。")
+                        raise RuntimeError("Codex 額度更新失敗，請確認連線後重試。")
                     return UsageSnapshot.from_response(message)
             if not initialized:
                 raise RuntimeError("Codex 連線逾時，請確認桌面版已登入。")
@@ -891,16 +918,18 @@ class FetchSignals(QObject):
 class UsageRing(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._remaining = 0.0
+        self._remaining: float | None = None
         self.setMinimumSize(160, 160)
         self.setAccessibleName("Codex 剩餘用量")
 
-    def set_remaining(self, value: float) -> None:
-        self._remaining = max(0.0, min(100.0, value))
-        self.setAccessibleDescription(f"剩餘 {percent_text(self._remaining)}")
+    def set_remaining(self, value: float | None) -> None:
+        self._remaining = None if value is None else max(0.0, min(100.0, value))
+        self.setAccessibleDescription("尚無資料" if self._remaining is None else f"剩餘 {percent_text(self._remaining)}")
         self.update()
 
     def _accent(self) -> QColor:
+        if self._remaining is None:
+            return QColor("#94A3B8")
         if self._remaining <= 15:
             return QColor("#F87171")
         if self._remaining <= 30:
@@ -910,21 +939,22 @@ class UsageRing(QWidget):
     def paintEvent(self, event: Any) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        compact = self.width() < 150
         side = min(self.width(), self.height()) - 22
         rect = QRectF((self.width() - side) / 2, (self.height() - side) / 2, side, side)
         painter.setPen(QPen(QColor("#223047"), 13, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.drawArc(rect, 90 * 16, -360 * 16)
         painter.setPen(QPen(self._accent(), 13, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawArc(rect, 90 * 16, int(-360 * 16 * self._remaining / 100))
+        painter.drawArc(rect, 90 * 16, int(-360 * 16 * (self._remaining or 0) / 100))
 
         painter.setPen(QColor("#F8FAFC"))
-        painter.setFont(ui_font(32, QFont.Weight.Bold))
-        value_rect = QRectF(0, self.height() / 2 - 36, self.width(), 58)
-        painter.drawText(value_rect, Qt.AlignmentFlag.AlignCenter, percent_text(self._remaining))
+        painter.setFont(ui_font((23 if compact else 32) if self._remaining is not None else (12 if compact else 17), QFont.Weight.Bold))
+        value_rect = QRectF(0, self.height() / 2 - (25 if compact else 36), self.width(), 42 if compact else 58)
+        painter.drawText(value_rect, Qt.AlignmentFlag.AlignCenter, "尚無資料" if self._remaining is None else percent_text(self._remaining))
 
         painter.setPen(QColor("#94A3B8"))
-        painter.setFont(ui_font(11, QFont.Weight.Medium))
-        label_rect = QRectF(0, self.height() / 2 + 22, self.width(), 25)
+        painter.setFont(ui_font(9 if compact else 11, QFont.Weight.Medium))
+        label_rect = QRectF(0, self.height() / 2 + (11 if compact else 22), self.width(), 25)
         painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, "剩餘可用")
 
 
@@ -996,7 +1026,7 @@ class MiniUsageWidget(QWidget):
     def __init__(self, owner: "UsageWidget") -> None:
         super().__init__(None)
         self.owner = owner
-        self._remaining = 0.0
+        self._remaining: float | None = None
         self._press_global: QPoint | None = None
         self._start_position: QPoint | None = None
         self._dragged = False
@@ -1012,12 +1042,14 @@ class MiniUsageWidget(QWidget):
         self.setToolTip("點一下展開 AI 用量小工具")
         self.setAccessibleName("AI 用量懸浮圖示")
 
-    def set_remaining(self, value: float) -> None:
-        self._remaining = max(0.0, min(100.0, value))
-        self.setAccessibleDescription(f"目前最低剩餘量 {percent_text(self._remaining)}")
+    def set_remaining(self, value: float | None) -> None:
+        self._remaining = None if value is None else max(0.0, min(100.0, value))
+        self.setAccessibleDescription("尚無資料" if self._remaining is None else f"目前最低剩餘量 {percent_text(self._remaining)}")
         self.update()
 
     def accent(self) -> QColor:
+        if self._remaining is None:
+            return QColor("#64748B")
         if self._remaining <= 15:
             return QColor("#F87171")
         if self._remaining <= 30:
@@ -1034,10 +1066,10 @@ class MiniUsageWidget(QWidget):
         painter.setPen(QPen(QColor("#26344A"), 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.drawArc(ring, 90 * 16, -360 * 16)
         painter.setPen(QPen(self.accent(), 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawArc(ring, 90 * 16, round(-360 * 16 * self._remaining / 100))
+        painter.drawArc(ring, 90 * 16, round(-360 * 16 * (self._remaining or 0) / 100))
         painter.setPen(QColor("#F8FAFC"))
         painter.setFont(ui_font(13, QFont.Weight.Bold))
-        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, percent_text(self._remaining))
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "—" if self._remaining is None else percent_text(self._remaining))
 
     def show_docked(self) -> None:
         saved = self.owner.settings.value("mini_position")
@@ -1128,7 +1160,7 @@ class SettingsDialog(QDialog):
         self.interval.addItem("每 1 分鐘", 60)
         self.interval.addItem("每 5 分鐘", 300)
         self.interval.addItem("每 15 分鐘", 900)
-        current_interval = int(settings.value("refresh_interval", 300))
+        current_interval = int(settings.value("refresh_interval", 60))
         index = self.interval.findData(current_interval)
         self.interval.setCurrentIndex(max(0, index))
         layout.addWidget(self.interval)
@@ -1188,10 +1220,10 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.codex_ring)
 
         self.autostart = QCheckBox("登入 Windows 時自動啟動")
-        self.autostart.setChecked(_setting_bool(settings, "autostart", True))
+        self.autostart.setChecked(_setting_bool(settings, "autostart", False))
         layout.addWidget(self.autostart)
 
-        self.check_updates = QCheckBox("檢查 QuotaDock 新版本（會連線 GitHub）")
+        self.check_updates = QCheckBox("檢查 Quota PromptDock 新版本（會連線 GitHub）")
         self.check_updates.setToolTip(
             "每天向 GitHub 查一次 release 清單。除了版本號之外不會送出任何資料。"
         )
@@ -1229,7 +1261,7 @@ class SettingsDialog(QDialog):
 class UsageWidget(QWidget):
     def __init__(self, screenshot_path: Path | None = None, demo: bool = False) -> None:
         super().__init__()
-        self.settings = QSettings("EricTools", "CodexUsageWidget")
+        self.settings = QSettings(str(APP_DIR / "preview.ini"), QSettings.Format.IniFormat) if demo or screenshot_path else QSettings("EricTools", "CodexUsageWidget")
         self.signals = FetchSignals()
         self.signals.succeeded.connect(self._on_fetch_success)
         self.signals.failed.connect(self._on_fetch_failure)
@@ -1258,15 +1290,20 @@ class UsageWidget(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(400, 678)
+        self.setFixedSize(400, min(940, QApplication.primaryScreen().availableGeometry().height() - 24))
         self.setStyleSheet(APP_STYLE)
         self.setAccessibleName(APP_NAME)
+        self.paste_controller = PasteController(self)
 
         self._build_ui()
         self._build_tray()
         self.alert_bubble = AlertBubble()
         self.mini = MiniUsageWidget(self)
         self._restore_position()
+        for screen in QApplication.screens():
+            screen.availableGeometryChanged.connect(self._fit_to_screen)
+        QApplication.instance().screenRemoved.connect(self._fit_to_screen)
+        QApplication.instance().screenAdded.connect(self._screen_added)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -1294,9 +1331,26 @@ class UsageWidget(QWidget):
             QTimer.singleShot(9000 if not demo else 900, self._save_screenshot_and_quit)
 
     def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
         shell = QFrame(self)
         shell.setObjectName("shell")
-        shell.setGeometry(6, 6, 388, 666)
+        outer.addWidget(shell)
+        self.surface_scroll = QScrollArea()
+        self.surface_scroll.setWidgetResizable(True)
+        self.surface_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.surface_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.surface_scroll.setStyleSheet("QScrollArea { background: transparent; border: 0; }")
+        self.surface_scroll.viewport().setObjectName("surfaceViewport")
+        self.surface_scroll.viewport().setStyleSheet("#surfaceViewport { background: transparent; }")
+        self.surface_scroll.setAccessibleName("Codex 與 Claude Code 額度")
+        quota_content = QWidget()
+        quota_content.setObjectName("quotaContent")
+        quota_content.setStyleSheet("#quotaContent { background: #0B1220; }")
+        self.surface_scroll.setWidget(quota_content)
+        quota = QVBoxLayout(quota_content)
+        quota.setContentsMargins(0, 0, 0, 0)
+        quota.setSpacing(8)
 
         root = QVBoxLayout(shell)
         root.setContentsMargins(22, 16, 22, 20)
@@ -1323,6 +1377,7 @@ class UsageWidget(QWidget):
         self.hide_button.clicked.connect(self.collapse_to_mini)
         header.addWidget(self.hide_button)
         root.addLayout(header)
+        root.addWidget(self.surface_scroll, 1)
 
         meta = QHBoxLayout()
         meta.setContentsMargins(0, 6, 0, 0)
@@ -1333,19 +1388,30 @@ class UsageWidget(QWidget):
         self.plan_badge.setObjectName("planBadge")
         meta.addWidget(self.plan_badge)
         meta.addStretch()
-        self.sync_label = QLabel("正在取得最新用量…")
+        self.sync_label = QLabel("正在取得用量…")
         self.sync_label.setObjectName("muted")
+        self.sync_label.setWordWrap(True)
+        self.sync_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.sync_label.setMinimumWidth(80)
+        self.sync_label.setMaximumWidth(130)
         meta.addWidget(self.sync_label)
-        root.addLayout(meta)
+        quota.addLayout(meta)
 
+        self.codex_summary = QHBoxLayout()
+        self.codex_summary.setSpacing(8)
+        quota.addLayout(self.codex_summary)
+        self.ring_column = QVBoxLayout()
+        self.ring_column.setSpacing(4)
+        self.codex_summary.addLayout(self.ring_column)
         self.ring = UsageRing()
         self.ring.setFixedSize(164, 164)
-        root.addWidget(self.ring, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.ring_column.addWidget(self.ring, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         self.used_label = QLabel("已使用 —")
         self.used_label.setObjectName("usedLabel")
         self.used_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(self.used_label)
+        self.used_label.setWordWrap(True)
+        self.ring_column.addWidget(self.used_label)
 
         self.cycle_card = QFrame()
         self.cycle_card.setObjectName("infoCard")
@@ -1375,7 +1441,7 @@ class UsageWidget(QWidget):
         cycle_layout.addWidget(self.reset_label)
         self.codex_five_section.hide()
         self.codex_week_section.hide()
-        root.addWidget(self.cycle_card)
+        self.ring_column.addWidget(self.cycle_card)
 
         self.claude_card = QFrame()
         self.claude_card.setObjectName("claudeCard")
@@ -1421,13 +1487,19 @@ class UsageWidget(QWidget):
         claude_layout.addWidget(self.claude_week_section)
         self.claude_five_section.hide()
         self.claude_week_section.hide()
-        root.addWidget(self.claude_card)
+        quota.addWidget(self.claude_card)
+        quota.addStretch()
 
-        root.addStretch()
+        prompt_title = QLabel("常用指令")
+        prompt_title.setObjectName("cardTitle")
+        root.addWidget(prompt_title)
+        self.prompt_panel = PromptPanel(PromptStore(APP_DIR / "prompts.json"), self.paste_controller, DIALOG_STYLE, self)
+        self.prompt_panel.setFixedHeight(258)
+        root.addWidget(self.prompt_panel)
 
         self.update_button = QPushButton()
         self.update_button.setObjectName("updateButton")
-        self.update_button.setAccessibleName("下載並安裝新版 QuotaDock")
+        self.update_button.setAccessibleName("下載並安裝新版 Quota PromptDock")
         self.update_button.clicked.connect(self._on_update_clicked)
         self.update_button.hide()
         root.addWidget(self.update_button)
@@ -1449,7 +1521,38 @@ class UsageWidget(QWidget):
         self.error_label.setObjectName("errorLabel")
         self.error_label.setWordWrap(True)
         self.error_label.hide()
-        root.addWidget(self.error_label)
+        quota.insertWidget(1, self.error_label)
+        self._compact_layout = False
+        self._adapt_layout()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_compact_layout"):
+            self._adapt_layout()
+
+    def _adapt_layout(self) -> None:
+        """縮小額度摘要，常用指令與底部操作保持可見；兩區不互相巢狀捲動。"""
+        compact = self.height() < 850
+        if compact == self._compact_layout:
+            return
+        self._compact_layout = compact
+        if compact:
+            self.ring_column.removeWidget(self.cycle_card)
+            self.codex_summary.addWidget(self.cycle_card, 1, Qt.AlignmentFlag.AlignVCenter)
+            self.ring.setFixedSize(116, 116)
+            self.used_label.setFixedWidth(116)
+            self.used_label.setStyleSheet("font-size: 12px;")
+            self.cycle_card.layout().setContentsMargins(10, 8, 10, 8)
+        else:
+            self.codex_summary.removeWidget(self.cycle_card)
+            self.ring_column.addWidget(self.cycle_card)
+            self.ring.setFixedSize(164, 164)
+            self.used_label.setMinimumWidth(0)
+            self.used_label.setMaximumWidth(16777215)
+            self.used_label.setStyleSheet("")
+            self.cycle_card.layout().setContentsMargins(16, 12, 16, 12)
+        if self._snapshot is not None:
+            self._set_ring_caption(codex_ring_window(self._snapshot, self._codex_ring_choice()))
 
     def _create_quota_section(
         self, title: str, bar_object: str = "claudeProgress"
@@ -1589,7 +1692,8 @@ class UsageWidget(QWidget):
         self._update_downloading = False
         self.update_button.setText("安裝中…請稍候")
         # 下載回來的就是完整安裝檔：它會關掉舊的、覆蓋安裝、再自己啟動。
-        subprocess.Popen([installer], close_fds=True, creationflags=CREATE_NO_WINDOW)
+        subprocess.Popen([installer, "--install"], close_fds=True, creationflags=CREATE_NO_WINDOW)
+        self.quit_app()
 
     def _on_update_failed(self, message: str) -> None:
         self._update_downloading = False
@@ -1670,7 +1774,9 @@ class UsageWidget(QWidget):
             self._save_snapshot(codex)
         else:
             message = str(result.get("codex_error") or "Codex 用量暫時無法讀取。")
-            self.sync_label.setText("Codex 同步失敗")
+            self._set_codex_error_badge(message)
+            last = datetime.fromtimestamp(self._snapshot.fetched_at, TAIWAN_TZ).strftime("%H:%M") if self._snapshot else ""
+            self.sync_label.setText(f"同步失敗\n上次 {last}" if last else "同步失敗")
             self.error_label.setText(message)
             self.error_label.show()
 
@@ -1708,21 +1814,18 @@ class UsageWidget(QWidget):
         )
 
     def _render_codex(self, snapshot: UsageSnapshot) -> None:
+        self.plan_badge.setStyleSheet("")
         plan_label = snapshot.plan_type.upper().replace("_", " ")
-        self.plan_badge.setText(plan_label)
-        self.sync_label.setText(datetime.fromtimestamp(snapshot.fetched_at).strftime("%H:%M 已更新"))
+        self.plan_badge.setText("尚無資料" if plan_label == "UNKNOWN" else plan_label)
+        self.sync_label.setText(datetime.fromtimestamp(snapshot.fetched_at, TAIWAN_TZ).strftime("%H:%M 已更新"))
 
         short, long_window = codex_windows(snapshot)
         ring_window = codex_ring_window(snapshot, self._codex_ring_choice())
         if ring_window is not None:
             self.ring.set_remaining(ring_window.remaining_percent)
-            self.used_label.setText(
-                f"{duration_label(ring_window.duration_minutes)} · 已使用 "
-                f"{percent_text(ring_window.used_percent)}"
-            )
         else:
-            self.ring.set_remaining(0)
-            self.used_label.setText("目前沒有可顯示的額度")
+            self.ring.set_remaining(None)
+        self._set_ring_caption(ring_window)
 
         for window, section, value, bar, reset in (
             (
@@ -1826,14 +1929,36 @@ class UsageWidget(QWidget):
         reset.setText(reset_time_label(window.resets_at))
         section.show()
 
+    def _set_ring_caption(self, window: UsageWindow | None) -> None:
+        if window is None:
+            self.used_label.setText("目前沒有額度資料")
+            return
+        separator = "\n" if self._compact_layout else " · "
+        self.used_label.setText(f"{duration_label(window.duration_minutes)}{separator}已使用 {percent_text(window.used_percent)}")
+
     def _on_fetch_failure(self, message: str) -> None:
         self._fetching = False
         self.refresh_button.setEnabled(True)
         self.refresh_button.setText("重新連線")
         self.sync_label.setText("同步失敗")
         friendly = message.strip() or "暫時無法讀取用量，稍後會自動重試。"
+        self._set_codex_error_badge(friendly)
         self.error_label.setText(friendly)
         self.error_label.show()
+
+    def _set_codex_error_badge(self, message: str) -> None:
+        if self._snapshot is not None:
+            return
+        if "登入" in message or "logged in" in message.lower():
+            label = "未登入"
+        elif "找不到" in message or "未安裝" in message:
+            label = "未找到"
+        else:
+            label = "更新失敗"
+        self.plan_badge.setText(label)
+        self.plan_badge.setStyleSheet("color: #FCA5A5; background: #2A151A;")
+        self.used_label.setText("尚無用量資料")
+        self.reset_label.setText("登入後可取得額度" if label == "未登入" else "請完成上方操作後再更新")
 
     def _handle_notifications(
         self, previous: UsageSnapshot | None, current: UsageSnapshot
@@ -1987,7 +2112,7 @@ class UsageWidget(QWidget):
             )
 
     def _apply_timer_setting(self) -> None:
-        interval = int(self.settings.value("refresh_interval", 300))
+        interval = int(self.settings.value("refresh_interval", 60))
         self.timer.start(max(60, interval) * 1000)
         self._update_mini_usage()
 
@@ -2032,10 +2157,11 @@ class UsageWidget(QWidget):
     def show_and_raise(self) -> None:
         self.mini.hide()
         # 螢幕組態可能在執行中變了，每次要現身前都確認自己還在畫面內。
-        self.move(self._on_screen_position(self.pos()))
+        self._fit_to_screen()
         self.show()
         self.raise_()
         self.activateWindow()
+        self.refresh()
 
     def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (
@@ -2049,6 +2175,7 @@ class UsageWidget(QWidget):
 
     def quit_app(self) -> None:
         self._force_quit = True
+        self.paste_controller.target.close()
         self.alert_bubble.close()
         self.mini.close()
         self.tray.hide()
@@ -2073,8 +2200,19 @@ class UsageWidget(QWidget):
 
     def mouseReleaseEvent(self, event: Any) -> None:
         self._drag_offset = None
+        self._fit_to_screen()
         self.settings.setValue("window_position", self.pos())
         super().mouseReleaseEvent(event)
+
+    def _screen_added(self, screen) -> None:
+        screen.availableGeometryChanged.connect(self._fit_to_screen)
+        self._fit_to_screen()
+
+    def _fit_to_screen(self, *args) -> None:
+        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        self.setFixedSize(min(400, max(200, area.width() - 16)), min(940, max(240, area.height() - 16)))
+        self.move(clamped_position(self.pos(), self.size(), area))
 
     def _on_screen_position(self, point: QPoint) -> QPoint:
         screen = QApplication.screenAt(point) or QApplication.primaryScreen()
@@ -2090,7 +2228,7 @@ class UsageWidget(QWidget):
                 self.settings.setValue("window_position", corrected)
             return
         screen = QApplication.primaryScreen().availableGeometry()
-        self.move(screen.right() - self.width() - 24, screen.top() + 24)
+        self.move(clamped_position(QPoint(screen.right() - self.width() - 16, screen.bottom() - self.height() - 16), self.size(), screen))
 
     def _save_screenshot_and_quit(self) -> None:
         if self._screenshot_path:
@@ -2122,6 +2260,7 @@ def snapshot_from_state(raw: dict[str, Any]) -> UsageSnapshot:
         reset_credits=int(raw.get("reset_credits", 0)),
         reached_type=raw.get("reached_type"),
         fetched_at=int(raw.get("fetched_at", 0)),
+        other_limits=raw.get("other_limits") or {},
     )
 
 
@@ -2256,7 +2395,7 @@ def install_frozen_release() -> bool:
         "$shell = New-Object -ComObject WScript.Shell; "
         "$shortcut = $shell.CreateShortcut($path); "
         "$shortcut.TargetPath = $target; $shortcut.WorkingDirectory = $folder; "
-        "$shortcut.Description = 'Codex and Claude Code quota monitor'; "
+        "$shortcut.Description = 'AI 額度與常用指令小工具'; "
         "$shortcut.IconLocation = \"$target,0\"; $shortcut.Save()"
     )
     subprocess.run(
@@ -2265,7 +2404,7 @@ def install_frozen_release() -> bool:
         creationflags=CREATE_NO_WINDOW,
         env=installer_env,
     )
-    _set_frozen_autostart(target, True)
+    _set_frozen_autostart(target, _setting_bool(QSettings("EricTools", "CodexUsageWidget"), "autostart", False))
     subprocess.Popen(
         [str(target)],
         cwd=str(install_dir),
@@ -2366,6 +2505,20 @@ QPushButton:disabled { background: #26344A; color: #94A3B8; }
 #textButton:checked { color: #35E28A; border-color: #2E8B61; background: #10271E; }
 #windowButton { min-width: 32px; max-width: 32px; min-height: 30px; padding: 0; background: transparent; color: #94A3B8; font-size: 18px; }
 #windowButton:hover { color: #FFFFFF; background: #1B293D; }
+#promptButton { min-height: 40px; background: #182438; color: #E2E8F0; border: 1px solid #334155; border-radius: 10px; font-size: 13px; font-weight: 600; padding: 0 8px; }
+#promptButton:hover { background: #223D32; border-color: #35E28A; }
+#promptButton:pressed { background: #244B39; }
+#promptButton:focus { border: 2px solid #35E28A; }
+#promptButton:disabled { background: #182438; color: #728198; }
+#promptTool { min-height: 30px; background: transparent; color: #94A3B8; border: 1px solid #26344A; border-radius: 8px; font-size: 12px; font-weight: 500; }
+#promptTool:hover { background: #223047; color: #F8FAFC; }
+#promptTool:focus { border: 2px solid #35E28A; }
+#secondaryButton:focus, #textButton:focus, #windowButton:focus, #updateButton:focus, #claudeLoginButton:focus { border: 2px solid #F8FAFC; }
+#secondaryButton:disabled, #promptTool:disabled { background: #111C2E; color: #728198; border-color: #26344A; }
+QScrollBar:vertical { background: #111C2E; width: 8px; border: 0; }
+QScrollBar::handle:vertical { background: #334155; border-radius: 4px; min-height: 24px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 QToolTip { background: #111C2E; color: #F8FAFC; border: 1px solid #334155; padding: 6px; font-size: 12px; }
 """.replace("__FONTS__", UI_FONT_CSS)
 
@@ -2379,6 +2532,12 @@ QComboBox QAbstractItemView { background: #111C2E; color: #F8FAFC; selection-bac
 QCheckBox { min-height: 30px; color: #E2E8F0; spacing: 9px; }
 QPushButton { min-height: 38px; border: 0; border-radius: 10px; background: #35E28A; color: #07130D; font-weight: 700; padding: 0 15px; }
 #secondaryButton { background: #182438; color: #E2E8F0; border: 1px solid #334155; }
+QPushButton:hover, #secondaryButton:hover { background: #223D32; color: #F8FAFC; }
+QPushButton:pressed, #secondaryButton:pressed { background: #244B39; }
+QPushButton:focus, #secondaryButton:focus { border: 2px solid #F8FAFC; }
+QPushButton:disabled, #secondaryButton:disabled { background: #111C2E; color: #728198; border: 1px solid #26344A; }
+QComboBox:focus { border: 2px solid #35E28A; }
+QCheckBox:focus { outline: none; border: 2px solid #35E28A; border-radius: 6px; }
 """.replace("__FONTS__", UI_FONT_CSS)
 
 
@@ -2386,12 +2545,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--demo", action="store_true", help="使用展示資料")
     parser.add_argument("--screenshot", type=Path, help="儲存介面截圖後結束")
+    parser.add_argument("--install", action="store_true", help="安裝到使用者目錄；預設直接執行免安裝版本")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if not args.demo and not args.screenshot and install_frozen_release():
+    if args.install and not args.demo and not args.screenshot and install_frozen_release():
         return 0
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -2401,9 +2561,29 @@ def main() -> int:
     app.setApplicationVersion(APP_VERSION)
     app.setQuitOnLastWindowClosed(False)
     app.setWindowIcon(make_app_icon())
+    server = None
+    if not args.demo and not args.screenshot:
+        name = "QuotaPromptDock-" + os.environ.get("USERNAME", "user")
+        socket = QLocalSocket()
+        socket.connectToServer(name)
+        if socket.waitForConnected(400):
+            socket.write(b"show"); socket.flush(); socket.waitForBytesWritten(400); socket.disconnectFromServer(); return 0
+        server = QLocalServer(app)
+        QLocalServer.removeServer(name)
+        if not server.listen(name):
+            QMessageBox.warning(None, APP_NAME, "無法啟動常駐服務，請確認是否已有程式正在執行。")
+            return 1
     widget = UsageWidget(screenshot_path=args.screenshot, demo=args.demo)
+    if server:
+        def wake_existing() -> None:
+            connection = server.nextPendingConnection()
+            if connection:
+                connection.close(); connection.deleteLater()
+            widget.show_and_raise()
+        server.newConnection.connect(wake_existing)
+    app.aboutToQuit.connect(widget.paste_controller.target.close)
     widget.show()
-    if not args.demo and not args.screenshot and _setting_bool(widget.settings, "autostart", True):
+    if not args.demo and not args.screenshot and _setting_bool(widget.settings, "autostart", False):
         configure_autostart(True)
     return app.exec()
 
