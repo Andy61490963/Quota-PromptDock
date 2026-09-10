@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, QPoint, QRect, QRectF, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPen
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -45,7 +45,9 @@ from prompt_tools import PasteController, PromptPanel, PromptStore
 
 
 APP_NAME = "Quota PromptDock"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.3"
+UI_SCALE_SETTING = "ui_scale_percent"
+UI_SCALE_CHOICES = (75, 90, 100, 110, 125, 150)
 TAIWAN_TZ = timezone(timedelta(hours=8))
 APP_DIR = Path(os.environ.get("QUOTA_PROMPTDOCK_DATA_DIR", str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CodexUsageWidget")))
 STATE_PATH = APP_DIR / "usage_state.json"
@@ -1136,6 +1138,22 @@ class MiniUsageWidget(QWidget):
             self.owner.quit_app()
 
 
+class SettingsComboBox(QComboBox):
+    """保留原生下拉與鍵盤操作，以向量箭頭避免系統按鈕底色覆蓋圓角框。"""
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#CBD5E1" if self.isEnabled() else "#728198"), 1.6,
+                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        x, y = self.width() - 16, self.height() / 2
+        arrow = QPainterPath()
+        arrow.moveTo(x - 4, y - 2)
+        arrow.lineTo(x, y + 2)
+        arrow.lineTo(x + 4, y - 2)
+        painter.drawPath(arrow)
+
+
 class SettingsDialog(QDialog):
     settings_changed = Signal()
 
@@ -1146,17 +1164,42 @@ class SettingsDialog(QDialog):
         self.setFixedWidth(360)
         self.setModal(True)
         self.setStyleSheet(DIALOG_STYLE)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(14)
-
-        title = QLabel("通知與更新")
+        screen = self.screen().availableGeometry()
+        self.resize(360, min(820, screen.height() - 32))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 20, 20, 20)
+        outer.setSpacing(14)
+        title = QLabel("小工具設定")
         title.setObjectName("dialogTitle")
-        layout.addWidget(title)
+        outer.addWidget(title)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet("QScrollArea { background: #0B1220; border: 0; }")
+        content = QWidget()
+        content.setObjectName("settingsContent")
+        content.setStyleSheet("#settingsContent { background: #0B1220; }")
+        self.scroll.setWidget(content)
+        outer.addWidget(self.scroll, 1)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(12)
+
+        layout.addWidget(QLabel("介面縮放"))
+        self.ui_scale = SettingsComboBox()
+        self.ui_scale.setAccessibleName("介面縮放比例")
+        for percent in UI_SCALE_CHOICES:
+            self.ui_scale.addItem(f"{percent}%" + ("（預設）" if percent == 100 else ""), percent)
+        self.ui_scale.setCurrentIndex(self.ui_scale.findData(ui_scale_percent(settings)))
+        layout.addWidget(self.ui_scale)
+        hint = QLabel("文字、按鈕與視窗一起縮放。變更比例後會重新開啟小工具，編輯好的指令會保留。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #94A3B8; font-size: 12px;")
+        layout.addWidget(hint)
 
         layout.addWidget(QLabel("自動更新頻率"))
-        self.interval = QComboBox()
+        self.interval = SettingsComboBox()
         self.interval.addItem("每 1 分鐘", 60)
         self.interval.addItem("每 5 分鐘", 300)
         self.interval.addItem("每 15 分鐘", 900)
@@ -1166,7 +1209,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.interval)
 
         layout.addWidget(QLabel("剩餘多少時提醒"))
-        self.threshold = QComboBox()
+        self.threshold = SettingsComboBox()
         for label, value in [("剩餘 20%", 20), ("剩餘 15%", 15), ("剩餘 10%", 10), ("剩餘 5%", 5)]:
             self.threshold.addItem(label, value)
         threshold_value = int(settings.value("low_threshold", 15))
@@ -1186,7 +1229,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.notify_low)
 
         layout.addWidget(QLabel("提醒訊息顯示時間"))
-        self.bubble_duration = QComboBox()
+        self.bubble_duration = SettingsComboBox()
         for label, value in [("5 秒", 5), ("10 秒", 10), ("15 秒", 15), ("30 秒", 30)]:
             self.bubble_duration.addItem(label, value)
         duration_value = int(settings.value("bubble_duration", 15))
@@ -1196,7 +1239,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.bubble_duration)
 
         layout.addWidget(QLabel("懸浮圖示顯示的數值"))
-        self.mini_source = QComboBox()
+        self.mini_source = SettingsComboBox()
         for label, value in [
             ("兩者取最低", "min"),
             ("只看 Codex", "codex"),
@@ -1208,7 +1251,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.mini_source)
 
         layout.addWidget(QLabel("主圓環顯示的 Codex 額度"))
-        self.codex_ring = QComboBox()
+        self.codex_ring = SettingsComboBox()
         for label, value in [
             ("自動（剩餘較低者）", "auto"),
             ("5 小時額度", "five_hour"),
@@ -1223,7 +1266,7 @@ class SettingsDialog(QDialog):
         self.autostart.setChecked(_setting_bool(settings, "autostart", False))
         layout.addWidget(self.autostart)
 
-        self.check_updates = QCheckBox("檢查 Quota PromptDock 新版本（會連線 GitHub）")
+        self.check_updates = QCheckBox("檢查新版本（連線 GitHub）")
         self.check_updates.setToolTip(
             "每天向 GitHub 查一次 release 清單。除了版本號之外不會送出任何資料。"
         )
@@ -1235,13 +1278,14 @@ class SettingsDialog(QDialog):
         cancel = QPushButton("取消")
         cancel.setObjectName("secondaryButton")
         cancel.clicked.connect(self.reject)
-        save = QPushButton("儲存設定")
+        save = QPushButton("儲存並套用")
         save.clicked.connect(self.save)
         actions.addWidget(cancel)
         actions.addWidget(save)
-        layout.addLayout(actions)
+        outer.addLayout(actions)
 
     def save(self) -> None:
+        self.settings.setValue(UI_SCALE_SETTING, self.ui_scale.currentData())
         self.settings.setValue("refresh_interval", self.interval.currentData())
         self.settings.setValue("low_threshold", self.threshold.currentData())
         self.settings.setValue("notify_reset", self.notify_reset.isChecked())
@@ -1282,6 +1326,11 @@ class UsageWidget(QWidget):
         self._screenshot_path = screenshot_path
         self._demo = demo
         self._force_quit = False
+        self._restart_requested = False
+        self._adjusting_height = False
+        self._content_fit_timer = QTimer(self)
+        self._content_fit_timer.setSingleShot(True)
+        self._content_fit_timer.timeout.connect(self._fit_content_height)
 
         self.setWindowTitle(APP_NAME)
         self.setWindowFlags(
@@ -1290,7 +1339,8 @@ class UsageWidget(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(400, min(940, QApplication.primaryScreen().availableGeometry().height() - 24))
+        self._height_limit = min(940, QApplication.primaryScreen().availableGeometry().height() - 24)
+        self.setFixedSize(400, self._height_limit)
         self.setStyleSheet(APP_STYLE)
         self.setAccessibleName(APP_NAME)
         self.paste_controller = PasteController(self)
@@ -1353,6 +1403,8 @@ class UsageWidget(QWidget):
         quota.setSpacing(8)
 
         root = QVBoxLayout(shell)
+        self._shell_layout = root
+        self._quota_layout = quota
         root.setContentsMargins(22, 16, 22, 20)
         root.setSpacing(8)
 
@@ -1524,6 +1576,35 @@ class UsageWidget(QWidget):
         quota.insertWidget(1, self.error_label)
         self._compact_layout = False
         self._adapt_layout()
+        shell.installEventFilter(self)
+        quota_content.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.LayoutRequest and not self._adjusting_height:
+            self._content_fit_timer.start(0)
+        return super().eventFilter(watched, event)
+
+    def _fit_content_height(self) -> None:
+        """依內容收緊高度並保留視窗底部位置，避免把空白留給額度區。"""
+        if self._adjusting_height:
+            return
+        self._adjusting_height = True
+        try:
+            self.layout().activate()
+            self._shell_layout.activate()
+            self._quota_layout.activate()
+            # 以最後一張卡片的實際邊界量測，避免文字換行的預估高度留下空隙。
+            needed = self.claude_card.geometry().bottom() + 1
+            surrounding = self.height() - self.surface_scroll.height()
+            height = min(self._height_limit, surrounding + needed)
+            if height != self.height():
+                bottom = self.geometry().bottom()
+                self.setFixedHeight(height)
+                self.move(self.x(), bottom - height + 1)
+                screen = QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen()
+                self.move(clamped_position(self.pos(), self.size(), screen.availableGeometry()))
+        finally:
+            self._adjusting_height = False
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -1532,7 +1613,8 @@ class UsageWidget(QWidget):
 
     def _adapt_layout(self) -> None:
         """縮小額度摘要，常用指令與底部操作保持可見；兩區不互相巢狀捲動。"""
-        compact = self.height() < 850
+        self.prompt_panel.setFixedHeight(min(258, max(144, self._height_limit - 272)))
+        compact = self._height_limit < 850
         if compact == self._compact_layout:
             return
         self._compact_layout = compact
@@ -2119,10 +2201,15 @@ class UsageWidget(QWidget):
     def open_settings(self) -> None:
         if self.mini.isVisible():
             self.expand_from_mini()
+        previous_scale = ui_scale_percent(self.settings)
         dialog = SettingsDialog(self.settings, self)
         dialog.settings_changed.connect(self._apply_timer_setting)
         dialog.settings_changed.connect(self._reapply_view)
-        dialog.exec()
+        if dialog.exec() == QDialog.DialogCode.Accepted and ui_scale_percent(self.settings) != previous_scale:
+            self.settings.setValue("window_position", self.pos())
+            self.settings.sync()
+            self._restart_requested = True
+            self.quit_app()
 
     def _apply_pin_label(self, checked: bool) -> None:
         """按鈕上寫的是「現在的狀態」，說明留給提示，免得看不出按了會變什麼。"""
@@ -2211,7 +2298,10 @@ class UsageWidget(QWidget):
     def _fit_to_screen(self, *args) -> None:
         screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
         area = screen.availableGeometry()
-        self.setFixedSize(min(400, max(200, area.width() - 16)), min(940, max(240, area.height() - 16)))
+        self._height_limit = min(940, max(240, area.height() - 24))
+        self.setFixedWidth(min(400, max(200, area.width() - 16)))
+        self._adapt_layout()
+        self._fit_content_height()
         self.move(clamped_position(self.pos(), self.size(), area))
 
     def _on_screen_position(self, point: QPoint) -> QPoint:
@@ -2309,6 +2399,33 @@ def _setting_bool(settings: QSettings, key: str, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).lower() in {"1", "true", "yes"}
+
+
+def ui_scale_percent(settings: QSettings) -> int:
+    try:
+        value = int(settings.value(UI_SCALE_SETTING, 100))
+    except (TypeError, ValueError, OverflowError):
+        return 100
+    return value if value in UI_SCALE_CHOICES else 100
+
+
+def configure_ui_scale(settings: QSettings) -> None:
+    """在建立 QApplication 前設定整體縮放；保留原始環境比例，避免重啟後累乘。"""
+    base = os.environ.get("QUOTA_PROMPTDOCK_BASE_SCALE_FACTOR", os.environ.get("QT_SCALE_FACTOR", "1"))
+    try:
+        factor = float(base)
+        if not math.isfinite(factor) or factor <= 0:
+            factor = 1.0
+    except ValueError:
+        factor = 1.0
+    os.environ["QUOTA_PROMPTDOCK_BASE_SCALE_FACTOR"] = str(factor)
+    os.environ["QT_SCALE_FACTOR"] = str(factor * ui_scale_percent(settings) / 100)
+
+
+def restart_command() -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, *sys.argv[1:]]
+    return [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
 
 
 def _set_frozen_autostart(executable: Path, enabled: bool) -> None:
@@ -2527,7 +2644,9 @@ DIALOG_STYLE = """
 QDialog { background: #0B1220; color: #F8FAFC; font-family: __FONTS__; font-size: 14px; }
 QLabel { color: #CBD5E1; font-family: __FONTS__; font-size: 14px; }
 #dialogTitle { color: #F8FAFC; font-size: 21px; font-weight: 750; }
-QComboBox { min-height: 38px; padding: 0 10px; border: 1px solid #334155; border-radius: 9px; background: #111C2E; color: #F8FAFC; }
+QComboBox { min-height: 38px; padding: 0 30px 0 10px; border: 1px solid #334155; border-radius: 9px; background: #111C2E; color: #F8FAFC; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 26px; border: 0; background: transparent; }
+QComboBox::down-arrow { image: none; }
 QComboBox QAbstractItemView { background: #111C2E; color: #F8FAFC; selection-background-color: #244B39; }
 QCheckBox { min-height: 30px; color: #E2E8F0; spacing: 9px; }
 QPushButton { min-height: 38px; border: 0; border-radius: 10px; background: #35E28A; color: #07130D; font-weight: 700; padding: 0 15px; }
@@ -2538,6 +2657,10 @@ QPushButton:focus, #secondaryButton:focus { border: 2px solid #F8FAFC; }
 QPushButton:disabled, #secondaryButton:disabled { background: #111C2E; color: #728198; border: 1px solid #26344A; }
 QComboBox:focus { border: 2px solid #35E28A; }
 QCheckBox:focus { outline: none; border: 2px solid #35E28A; border-radius: 6px; }
+QScrollBar:vertical { background: #111C2E; width: 8px; border: 0; }
+QScrollBar::handle:vertical { background: #334155; border-radius: 4px; min-height: 24px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 """.replace("__FONTS__", UI_FONT_CSS)
 
 
@@ -2553,6 +2676,8 @@ def main() -> int:
     args = parse_args()
     if args.install and not args.demo and not args.screenshot and install_frozen_release():
         return 0
+    scale_settings = QSettings(str(APP_DIR / "preview.ini"), QSettings.Format.IniFormat) if args.demo or args.screenshot else QSettings("EricTools", "CodexUsageWidget")
+    configure_ui_scale(scale_settings)
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
@@ -2585,7 +2710,21 @@ def main() -> int:
     widget.show()
     if not args.demo and not args.screenshot and _setting_bool(widget.settings, "autostart", False):
         configure_autostart(True)
-    return app.exec()
+    exit_code = app.exec()
+    if widget._restart_requested:
+        # 舊服務先釋放，避免新程序只喚醒即將退出的視窗。
+        if server:
+            server.close()
+            QLocalServer.removeServer(name)
+        environment = os.environ.copy()
+        # 單檔包必須解壓至自己的目錄，不能沿用即將被舊程序清除的目錄。
+        environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        try:
+            subprocess.Popen(restart_command(), env=environment, close_fds=True, creationflags=CREATE_NO_WINDOW)
+        except OSError:
+            QMessageBox.warning(None, APP_NAME, "縮放設定已保存，但重新開啟失敗。請手動開啟小工具。")
+            return 1
+    return exit_code
 
 
 if __name__ == "__main__":

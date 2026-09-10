@@ -228,8 +228,9 @@ class PromptEditor(QDialog):
     def __init__(self, prompts: list[Prompt], style: str, parent=None, *, save_callback: Callable[[list[Prompt]], None] | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("編輯常用指令")
-        self.resize(700, 530)
-        self.setMinimumSize(580, 440)
+        area = (parent.screen() if parent else QApplication.primaryScreen()).availableGeometry()
+        self.setMinimumSize(min(580, area.width() - 32), min(440, area.height() - 32))
+        self.resize(min(700, area.width() - 32), min(530, area.height() - 32))
         self.setStyleSheet(style + EDITOR_STYLE)
         self.prompts = list(prompts)
         self._save_callback = save_callback

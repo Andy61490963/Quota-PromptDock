@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox
 
 import app
 import prompt_tools as pt
@@ -269,6 +269,7 @@ def test_widget_stale_data_and_small_screen(qapp, tmp_path, monkeypatch):
     assert widget.ring._remaining == before
     assert "同步失敗" in widget.sync_label.text()
     assert widget.prompt_panel.isEnabled()
+    widget._height_limit = 530
     widget.setFixedSize(400, 530)
     QTest.qWait(30)
     assert widget.surface_scroll.verticalScrollBar().maximum() > 0
@@ -282,6 +283,37 @@ def test_widget_stale_data_and_small_screen(qapp, tmp_path, monkeypatch):
     widget._render_codex(app.UsageSnapshot.from_response({}))
     assert widget.ring._remaining is None
     assert "沒有" in widget.used_label.text()
+    widget._force_quit = True
+    widget.tray.hide()
+    widget.close()
+
+
+def test_short_quota_card_removes_gap_and_keeps_bottom_position(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DIR", tmp_path)
+    monkeypatch.setattr(app, "STATE_PATH", tmp_path / "usage.json")
+    monkeypatch.setattr(app, "CLAUDE_STATE_PATH", tmp_path / "claude.json")
+    monkeypatch.setattr(app, "PasteController", lambda parent: pt.PasteController(parent, target=FakeTarget()))
+    widget = app.UsageWidget(demo=True)
+    widget.show()
+    QTest.qWait(160)
+    full_height = widget.height()
+    bottom = widget.geometry().bottom()
+    snapshot = {"codex": app._demo_snapshot(), "claude": app.ClaudeUsageSnapshot.unavailable(installed=False)}
+    widget._on_fetch_success(snapshot)
+    QTest.qWait(60)
+    title = next(label for label in widget.findChildren(QLabel) if label.text() == "常用指令")
+    gap = title.mapTo(widget, QPoint()).y() - widget.claude_card.mapTo(widget, widget.claude_card.rect().bottomLeft()).y() - 1
+    assert 0 <= gap <= 16
+    assert widget.height() < full_height
+    assert widget.geometry().bottom() == bottom
+    compact_height = widget.height()
+    widget._fit_to_screen()
+    widget._on_fetch_success(snapshot)
+    QTest.qWait(60)
+    assert widget.height() == compact_height
+    widget._on_fetch_success({"codex": app._demo_snapshot(), "claude": app._demo_claude_snapshot()})
+    QTest.qWait(60)
+    assert widget.height() > compact_height and widget.height() <= widget._height_limit
     widget._force_quit = True
     widget.tray.hide()
     widget.close()
@@ -303,6 +335,80 @@ def test_first_quota_failure_exits_connecting_state(qapp, tmp_path, monkeypatch,
     widget._on_fetch_success({"codex_error": message})
     assert widget.plan_badge.text() == "PLUS" and widget.ring._remaining == snapshot.primary.remaining_percent
     assert "上次" in widget.sync_label.text()
+    widget._force_quit = True
+    widget.tray.hide()
+    widget.close()
+
+
+@pytest.mark.parametrize("value,expected", [(75, 75), (150, 150), ("125", 125), ("壞掉", 100), (0, 100), (500, 100)])
+def test_ui_scale_setting_validation(tmp_path, value, expected):
+    settings = QSettings(str(tmp_path / "scale.ini"), QSettings.Format.IniFormat)
+    settings.setValue(app.UI_SCALE_SETTING, value)
+    assert app.ui_scale_percent(settings) == expected
+
+
+def test_scale_survives_reload_without_compounding_environment(tmp_path, monkeypatch):
+    settings = QSettings(str(tmp_path / "scale.ini"), QSettings.Format.IniFormat)
+    monkeypatch.delenv("QUOTA_PROMPTDOCK_BASE_SCALE_FACTOR", raising=False)
+    monkeypatch.setenv("QT_SCALE_FACTOR", "1.5")
+    settings.setValue(app.UI_SCALE_SETTING, 125)
+    settings.sync()
+    app.configure_ui_scale(settings)
+    assert float(app.os.environ["QT_SCALE_FACTOR"]) == 1.875
+    settings = QSettings(str(tmp_path / "scale.ini"), QSettings.Format.IniFormat)
+    app.configure_ui_scale(settings)
+    assert float(app.os.environ["QT_SCALE_FACTOR"]) == 1.875
+    settings.setValue(app.UI_SCALE_SETTING, 100)
+    app.configure_ui_scale(settings)
+    assert float(app.os.environ["QT_SCALE_FACTOR"]) == 1.5
+
+
+def test_scale_settings_cancel_and_save(qapp, tmp_path, monkeypatch):
+    settings = QSettings(str(tmp_path / "scale.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(app, "configure_autostart", lambda enabled: None)
+    dialog = app.SettingsDialog(settings)
+    dialog.ui_scale.setCurrentIndex(dialog.ui_scale.findData(150))
+    dialog.reject()
+    assert app.ui_scale_percent(settings) == 100
+    dialog = app.SettingsDialog(settings)
+    dialog.ui_scale.setCurrentIndex(dialog.ui_scale.findData(125))
+    dialog.save()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    assert app.ui_scale_percent(settings) == 125
+
+
+def test_scale_arrow_opens_menu_and_keyboard_selects(qapp, tmp_path):
+    settings = QSettings(str(tmp_path / "scale.ini"), QSettings.Format.IniFormat)
+    dialog = app.SettingsDialog(settings)
+    dialog.show()
+    QTest.qWait(30)
+    combo = dialog.ui_scale
+    QTest.mouseClick(combo, Qt.MouseButton.LeftButton, pos=QPoint(combo.width() - 16, combo.height() // 2))
+    assert combo.view().isVisible()
+    QTest.keyClick(combo.view(), Qt.Key.Key_Down)
+    QTest.keyClick(combo.view(), Qt.Key.Key_Return)
+    assert combo.currentData() == 110 and not combo.view().isVisible()
+    dialog.close()
+
+
+def test_scale_change_requests_restart_only_after_accept(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "APP_DIR", tmp_path)
+    monkeypatch.setattr(app, "PasteController", lambda parent: pt.PasteController(parent, target=FakeTarget()))
+    widget = app.UsageWidget(demo=True)
+    quit_requests = []
+    monkeypatch.setattr(widget, "quit_app", lambda: quit_requests.append(True))
+    class Dialog:
+        settings_changed = widget.signals.login_finished
+        def __init__(self, settings, parent): self.settings = settings
+        def exec(self):
+            self.settings.setValue(app.UI_SCALE_SETTING, 125)
+            return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(app, "SettingsDialog", Dialog)
+    widget.open_settings()
+    assert widget._restart_requested and quit_requests == [True]
+    widget._restart_requested = False
+    widget.open_settings()
+    assert not widget._restart_requested and quit_requests == [True]
     widget._force_quit = True
     widget.tray.hide()
     widget.close()

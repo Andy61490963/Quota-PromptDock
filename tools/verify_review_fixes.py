@@ -110,6 +110,7 @@ widget.grab().save(str(out / "首次未登入.png"))
 report["未登入徽章"] = widget.plan_badge.text() == "未登入"
 report["未登入仍可用指令"] = widget.prompt_panel.isEnabled()
 widget._on_fetch_success({"codex": app._demo_snapshot(), "claude": app._demo_claude_snapshot()})
+widget._height_limit = 664
 widget.setFixedSize(400, 664)
 QTest.qWait(40)
 widget.surface_scroll.verticalScrollBar().setValue(widget.surface_scroll.verticalScrollBar().maximum())
