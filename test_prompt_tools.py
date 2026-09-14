@@ -309,12 +309,17 @@ def test_short_quota_card_removes_gap_and_keeps_bottom_position(qapp, tmp_path, 
     # Wait for the actual demo result and its layout, not a fixed wall-clock delay.
     # A slower runner can still be showing the shorter loading state after 160 ms.
     deadline = time.monotonic() + 5
+    previous_height, stable_frames = None, 0
     while time.monotonic() < deadline:
         QTest.qWait(20)
-        if widget._snapshot is not None and widget._claude_snapshot is not None and not widget._content_fit_timer.isActive():
+        ready = widget._snapshot is not None and widget._claude_snapshot is not None and not widget._content_fit_timer.isActive()
+        stable_frames = stable_frames + 1 if ready and widget.height() == previous_height else 0
+        previous_height = widget.height()
+        if stable_frames >= 3:
             break
     assert widget._snapshot is not None and widget._claude_snapshot is not None
     assert not widget._content_fit_timer.isActive()
+    assert stable_frames >= 3
     full_height = widget.height()
     bottom = widget.geometry().bottom()
     snapshot = {"codex": app._demo_snapshot(), "claude": app.ClaudeUsageSnapshot.unavailable(installed=False)}
