@@ -262,6 +262,10 @@ def test_widget_stale_data_and_small_screen(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(app, "CLAUDE_STATE_PATH", tmp_path / "claude.json")
     monkeypatch.setattr(app, "PasteController", lambda parent: pt.PasteController(parent, target=FakeTarget()))
     widget = app.UsageWidget(demo=True)
+    # Keep the original no-token layout contract; the added panel has its own
+    # small-screen and scroll-reachability tests.
+    widget.settings.setValue(app.SHOW_TOKEN_SETTING, False)
+    widget._reapply_view()
     widget.show()
     QTest.qWait(130)
     before = widget.ring._remaining
@@ -294,6 +298,8 @@ def test_short_quota_card_removes_gap_and_keeps_bottom_position(qapp, tmp_path, 
     monkeypatch.setattr(app, "CLAUDE_STATE_PATH", tmp_path / "claude.json")
     monkeypatch.setattr(app, "PasteController", lambda parent: pt.PasteController(parent, target=FakeTarget()))
     widget = app.UsageWidget(demo=True)
+    widget.settings.setValue(app.SHOW_TOKEN_SETTING, False)
+    widget._reapply_view()
     widget.show()
     QTest.qWait(160)
     full_height = widget.height()
