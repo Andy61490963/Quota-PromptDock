@@ -1,6 +1,7 @@
 """驗證資料保存與 Qt 操作；原生貼上以替身隔離，不操作使用者的視窗。"""
 import ctypes
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -292,7 +293,11 @@ def test_widget_stale_data_and_small_screen(qapp, tmp_path, monkeypatch):
     widget.close()
 
 
-def test_short_quota_card_removes_gap_and_keeps_bottom_position(qapp, tmp_path, monkeypatch):
+@pytest.mark.parametrize("demo_delay", [100, 350])
+def test_short_quota_card_removes_gap_and_keeps_bottom_position(qapp, tmp_path, monkeypatch, demo_delay):
+    original_single_shot = app.QTimer.singleShot
+    monkeypatch.setattr(app.QTimer, "singleShot", lambda delay, callback:
+                        original_single_shot(demo_delay if delay == 100 else delay, callback))
     monkeypatch.setattr(app, "APP_DIR", tmp_path)
     monkeypatch.setattr(app, "STATE_PATH", tmp_path / "usage.json")
     monkeypatch.setattr(app, "CLAUDE_STATE_PATH", tmp_path / "claude.json")
@@ -301,7 +306,15 @@ def test_short_quota_card_removes_gap_and_keeps_bottom_position(qapp, tmp_path, 
     widget.settings.setValue(app.SHOW_TOKEN_SETTING, False)
     widget._reapply_view()
     widget.show()
-    QTest.qWait(160)
+    # Wait for the actual demo result and its layout, not a fixed wall-clock delay.
+    # A slower runner can still be showing the shorter loading state after 160 ms.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        QTest.qWait(20)
+        if widget._snapshot is not None and widget._claude_snapshot is not None and not widget._content_fit_timer.isActive():
+            break
+    assert widget._snapshot is not None and widget._claude_snapshot is not None
+    assert not widget._content_fit_timer.isActive()
     full_height = widget.height()
     bottom = widget.geometry().bottom()
     snapshot = {"codex": app._demo_snapshot(), "claude": app.ClaudeUsageSnapshot.unavailable(installed=False)}
