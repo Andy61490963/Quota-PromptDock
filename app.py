@@ -44,10 +44,11 @@ from PySide6.QtWidgets import (
 )
 from prompt_tools import PasteController, PromptPanel, PromptStore
 from token_panel import SHOW_TOKEN_SETTING, TokenUsagePanel, TokenUsageService, demo_report
+from odometer import DigitRoller, OdometerLabel
 
 
 APP_NAME = "Quota PromptDock"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 UI_SCALE_SETTING = "ui_scale_percent"
 UI_SCALE_CHOICES = (75, 90, 100, 110, 125, 150)
 TAIWAN_TZ = timezone(timedelta(hours=8))
@@ -923,12 +924,15 @@ class UsageRing(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._remaining: float | None = None
+        self.roller = DigitRoller(self)
         self.setMinimumSize(160, 160)
         self.setAccessibleName("Codex 剩餘用量")
+        self.roller.set_text("尚無資料")
 
     def set_remaining(self, value: float | None) -> None:
         self._remaining = None if value is None else max(0.0, min(100.0, value))
         self.setAccessibleDescription("尚無資料" if self._remaining is None else f"剩餘 {percent_text(self._remaining)}")
+        self.roller.set_text("尚無資料" if self._remaining is None else percent_text(self._remaining))
         self.update()
 
     def _accent(self) -> QColor:
@@ -954,7 +958,7 @@ class UsageRing(QWidget):
         painter.setPen(QColor("#F8FAFC"))
         painter.setFont(ui_font((23 if compact else 32) if self._remaining is not None else (12 if compact else 17), QFont.Weight.Bold))
         value_rect = QRectF(0, self.height() / 2 - (25 if compact else 36), self.width(), 42 if compact else 58)
-        painter.drawText(value_rect, Qt.AlignmentFlag.AlignCenter, "尚無資料" if self._remaining is None else percent_text(self._remaining))
+        self.roller.paint(painter, value_rect, Qt.AlignmentFlag.AlignCenter)
 
         painter.setPen(QColor("#94A3B8"))
         painter.setFont(ui_font(9 if compact else 11, QFont.Weight.Medium))
@@ -1031,6 +1035,7 @@ class MiniUsageWidget(QWidget):
         super().__init__(None)
         self.owner = owner
         self._remaining: float | None = None
+        self.roller = DigitRoller(self)
         self._press_global: QPoint | None = None
         self._start_position: QPoint | None = None
         self._dragged = False
@@ -1045,10 +1050,12 @@ class MiniUsageWidget(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("點一下展開 AI 用量小工具")
         self.setAccessibleName("AI 用量懸浮圖示")
+        self.roller.set_text("—")
 
     def set_remaining(self, value: float | None) -> None:
         self._remaining = None if value is None else max(0.0, min(100.0, value))
         self.setAccessibleDescription("尚無資料" if self._remaining is None else f"目前最低剩餘量 {percent_text(self._remaining)}")
+        self.roller.set_text("—" if self._remaining is None else percent_text(self._remaining))
         self.update()
 
     def accent(self) -> QColor:
@@ -1073,7 +1080,7 @@ class MiniUsageWidget(QWidget):
         painter.drawArc(ring, 90 * 16, round(-360 * 16 * (self._remaining or 0) / 100))
         painter.setPen(QColor("#F8FAFC"))
         painter.setFont(ui_font(13, QFont.Weight.Bold))
-        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "—" if self._remaining is None else percent_text(self._remaining))
+        self.roller.paint(painter, self.rect(), Qt.AlignmentFlag.AlignCenter)
 
     def show_docked(self) -> None:
         saved = self.owner.settings.value("mini_position")
@@ -1486,7 +1493,7 @@ class UsageWidget(QWidget):
         self.ring.setFixedSize(164, 164)
         self.ring_column.addWidget(self.ring, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        self.used_label = QLabel("已使用 —")
+        self.used_label = OdometerLabel("已使用 —")
         self.used_label.setObjectName("usedLabel")
         self.used_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.used_label.setWordWrap(True)
@@ -1514,7 +1521,7 @@ class UsageWidget(QWidget):
         # 兩個視窗都沒有時才退回這行文字，不然卡片會整個空著。
         self.cycle_label = QLabel("額度週期")
         self.cycle_label.setObjectName("cardTitle")
-        self.reset_label = QLabel("等待 Codex 回傳重置時間")
+        self.reset_label = OdometerLabel("等待 Codex 回傳重置時間", exclude_after="重置")
         self.reset_label.setObjectName("cardValue")
         cycle_layout.addWidget(self.cycle_label)
         cycle_layout.addWidget(self.reset_label)
@@ -1699,7 +1706,7 @@ class UsageWidget(QWidget):
         header = QHBoxLayout()
         name = QLabel(title)
         name.setObjectName("quotaName")
-        value = QLabel("剩餘 —")
+        value = OdometerLabel("剩餘 —")
         value.setObjectName("quotaValue")
         header.addWidget(name)
         header.addStretch()
@@ -1711,7 +1718,7 @@ class UsageWidget(QWidget):
         bar.setTextVisible(False)
         bar.setFixedHeight(7)
         layout.addWidget(bar)
-        reset = QLabel("重置時間未提供")
+        reset = OdometerLabel("重置時間未提供", exclude_after="重置")
         reset.setObjectName("quotaReset")
         layout.addWidget(reset)
         return section, value, bar, reset

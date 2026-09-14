@@ -1,6 +1,7 @@
 name: Build Windows release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -10,6 +11,7 @@ permissions:
 
 jobs:
   windows-release:
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
 
     steps:

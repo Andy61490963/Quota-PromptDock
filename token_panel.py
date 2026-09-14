@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDial
 
 from token_usage import (PERIODS, TAIWAN_TZ, TokenUsageCollector, TokenUsageStore,
                          UsageGroup, UsageReport)
+from odometer import OdometerLabel, OdometerItemDelegate, KEY_ROLE
 
 SHOW_TOKEN_SETTING = "tokens/show_panel"
 TOKEN_PERIOD_SETTING = "tokens/period"
@@ -247,7 +248,7 @@ class TokenUsagePanel(QFrame):
         self.period.currentIndexChanged.connect(self._change_period)
         header.addWidget(self.period)
         layout.addLayout(header)
-        self.total = QLabel("— Token")
+        self.total = OdometerLabel("— Token")
         self.total.setObjectName("tokenTotal")
         layout.addWidget(self.total)
         self.rows = []
@@ -259,7 +260,7 @@ class TokenUsagePanel(QFrame):
             row_stack.setSpacing(4)
             row_layout = QHBoxLayout()
             row_layout.setSpacing(6)
-            name, value = ElidedLabel(), QLabel()
+            name, value = ElidedLabel(), OdometerLabel()
             badge = QLabel()
             badge.setObjectName("effortBadge")
             row_layout.addWidget(name, 1)
@@ -276,7 +277,7 @@ class TokenUsagePanel(QFrame):
             self.rows.append((row, name, value))
             row.hide()
         footer = QHBoxLayout()
-        self.more = QLabel()
+        self.more = OdometerLabel()
         footer.addWidget(self.more, 1)
         self.details = QPushButton("查看全部  ›")
         self.details.setFixedSize(96, 30)
@@ -285,7 +286,7 @@ class TokenUsagePanel(QFrame):
         self.details.clicked.connect(self.open_details)
         footer.addWidget(self.details)
         layout.addLayout(footer)
-        self.status = QLabel("本機已記錄用量 · 準備讀取")
+        self.status = OdometerLabel("本機已記錄用量 · 準備讀取")
         self.status.setObjectName("tokenStatus")
         layout.addWidget(self.status)
 
@@ -393,7 +394,7 @@ def display_model(model):
     return model.replace("gpt-", "GPT-", 1).replace("-astra", " Astra").replace("-sol", " Sol").replace("-luna", " Luna") if model else "未知模型"
 
 
-class TokenCellDelegate(QStyledItemDelegate):
+class TokenCellDelegate(OdometerItemDelegate):
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
         # The whole selected row remains visible, including during keyboard navigation.
@@ -449,7 +450,7 @@ class TokenDetailsDialog(QDialog):
         self.title = QLabel("Codex Token 用量")
         self.title.setObjectName("dialogTitle")
         heading.addWidget(self.title)
-        self.summary = QLabel("本機已記錄用量 · 讀取中…")
+        self.summary = OdometerLabel("本機已記錄用量 · 讀取中…")
         self.summary.setObjectName("muted")
         heading.addWidget(self.summary)
         header.addLayout(heading, 1)
@@ -472,7 +473,7 @@ class TokenDetailsDialog(QDialog):
             card_layout.setSpacing(3)
             caption = QLabel(label)
             caption.setObjectName("muted")
-            number = QLabel("—")
+            number = OdometerLabel("—")
             number.setObjectName("metricValue")
             note = QLabel(hint)
             note.setObjectName("muted")
@@ -482,7 +483,7 @@ class TokenDetailsDialog(QDialog):
             self.metrics.append(number)
         layout.addLayout(metrics)
         section = QHBoxLayout()
-        self.group_heading = QLabel("模型與推理強度")
+        self.group_heading = OdometerLabel("模型與推理強度")
         self.group_heading.setObjectName("sectionTitle")
         section.addWidget(self.group_heading, 1)
         self.advanced = QPushButton("快取與推理明細")
@@ -514,7 +515,7 @@ class TokenDetailsDialog(QDialog):
         self.next.setObjectName("secondaryButton")
         self.previous.clicked.connect(lambda: self._move_page(-1))
         self.next.clicked.connect(lambda: self._move_page(1))
-        self.page_label = QLabel()
+        self.page_label = OdometerLabel()
         self.page_label.setObjectName("muted")
         navigation.addWidget(self.page_label, 1)
         navigation.addWidget(self.previous)
@@ -614,6 +615,7 @@ class TokenDetailsDialog(QDialog):
                     item.setForeground(QColor("#9BC4F5"))
                 if column >= 2:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    item.setData(KEY_ROLE, repr((report.period, group.model, group.effort, column)))
                 if column == 4:
                     item.setForeground(QColor("#85E8BE"))
                     font = QFont(self.font())
@@ -623,6 +625,7 @@ class TokenDetailsDialog(QDialog):
             if self._selected == (group.model, group.effort) and not changed:
                 selected_row = index
         self.groups.blockSignals(False)
+        self.groups.itemDelegate().animate_items()
         detail = coverage_text(report)
         self._fit_group_rows()
         self.coverage.setText(("部分歷史未納入 · 查看說明" if any(report.issues.values()) else "本機紀錄 · 台灣時間") +
@@ -709,10 +712,12 @@ class TokenDetailsDialog(QDialog):
                 item.setToolTip(f"對話：{row['thread_id']}\n回合：{row['turn_id']}" if column == 1 else text)
                 if column >= 2:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    item.setData(KEY_ROLE, repr((self.report.period, self._selected, row['thread_id'], row['turn_id'], column)))
                 if column == 4:
                     item.setForeground(QColor("#85E8BE"))
                 self.turn_table.setItem(index, column, item)
         pages = max(1, (count + 99) // 100)
+        self.turn_table.itemDelegate().animate_items()
         self.page_label.setText(f"共 {count:,} 回合  ·  第 {self._page + 1} / {pages} 頁" if count else "此區間沒有可顯示的回合紀錄")
         self.previous.setEnabled(self._page > 0)
         self.next.setEnabled(self._page + 1 < pages)
