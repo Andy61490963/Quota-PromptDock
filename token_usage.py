@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
+from api_pricing import estimate_response_usd
+
 TAIWAN_TZ = timezone(timedelta(hours=8))
 PERIODS = (("今日", "today"), ("近 7 天", "week"), ("本月", "month"), ("全部", "all"))
 COUNTERS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
@@ -106,6 +108,8 @@ class UsageGroup:
     reasoning_output_tokens: int | None
     responses: int
     turns: int
+    api_cost_usd: float = 0.0
+    priced_responses: int = 0
 
 
 @dataclass(frozen=True)
@@ -119,6 +123,14 @@ class UsageReport:
     issues: dict[str, int]
     sources: int
     updated_at: float
+
+    @property
+    def api_cost_usd(self) -> float:
+        return sum(group.api_cost_usd for group in self.groups)
+
+    @property
+    def priced_responses(self) -> int:
+        return sum(group.priced_responses for group in self.groups)
 
 
 class TokenUsageStore:
@@ -161,6 +173,7 @@ class TokenUsageStore:
     def connection(self):
         db = sqlite3.connect(self.path, timeout=3)
         db.row_factory = sqlite3.Row
+        db.create_function("api_cost", 5, estimate_response_usd, deterministic=True)
         try:
             yield db
         finally:
@@ -209,7 +222,11 @@ class TokenUsageStore:
                        CASE WHEN COUNT(r.cached_input_tokens)=COUNT(*) THEN SUM(r.cached_input_tokens) END cached_input_tokens,
                        CASE WHEN COUNT(r.cache_write_input_tokens)=COUNT(*) THEN SUM(r.cache_write_input_tokens) END cache_write_input_tokens,
                        CASE WHEN COUNT(r.reasoning_output_tokens)=COUNT(*) THEN SUM(r.reasoning_output_tokens) END reasoning_output_tokens,
-                       COUNT(*) responses, COUNT(DISTINCT r.thread_id || ':' || r.turn_id) turns
+                       COUNT(*) responses, COUNT(DISTINCT r.thread_id || ':' || r.turn_id) turns,
+                       COALESCE(SUM(api_cost(CASE WHEN c.ambiguous=1 THEN '' ELSE c.model END,
+                           r.input_tokens,r.cached_input_tokens,r.cache_write_input_tokens,r.output_tokens)),0.0) api_cost_usd,
+                       COUNT(api_cost(CASE WHEN c.ambiguous=1 THEN '' ELSE c.model END,
+                           r.input_tokens,r.cached_input_tokens,r.cache_write_input_tokens,r.output_tokens)) priced_responses
                 FROM responses r LEFT JOIN contexts c USING(turn_id)
                 WHERE r.conflict=0 AND r.occurred_at>=? AND r.occurred_at<?
                 GROUP BY 1,2 ORDER BY total_tokens DESC,model,effort
@@ -242,7 +259,11 @@ class TokenUsageStore:
             count = db.execute("SELECT COUNT(*) FROM (SELECT 1 " + where + ")", args).fetchone()[0]
             rows = db.execute("""SELECT r.thread_id,r.turn_id,MIN(r.occurred_at) first_at,
                 SUM(r.input_tokens) input_tokens,SUM(r.output_tokens) output_tokens,
-                SUM(r.total_tokens) total_tokens,COUNT(*) responses """ + where +
+                SUM(r.total_tokens) total_tokens,COUNT(*) responses,
+                COALESCE(SUM(api_cost(CASE WHEN c.ambiguous=1 THEN '' ELSE c.model END,
+                    r.input_tokens,r.cached_input_tokens,r.cache_write_input_tokens,r.output_tokens)),0.0) api_cost_usd,
+                COUNT(api_cost(CASE WHEN c.ambiguous=1 THEN '' ELSE c.model END,
+                    r.input_tokens,r.cached_input_tokens,r.cache_write_input_tokens,r.output_tokens)) priced_responses """ + where +
                 " ORDER BY first_at DESC,r.thread_id,r.turn_id LIMIT ? OFFSET ?",
                 (*args, page_size, page * page_size)).fetchall()
         return [dict(row) for row in rows], count

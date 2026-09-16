@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDial
 from token_usage import (PERIODS, TAIWAN_TZ, TokenUsageCollector, TokenUsageStore,
                          UsageGroup, UsageReport)
 from odometer import OdometerLabel, OdometerItemDelegate, KEY_ROLE
+from api_pricing import estimate_response_usd, format_cost, pricing_description
 
 SHOW_TOKEN_SETTING = "tokens/show_panel"
 TOKEN_PERIOD_SETTING = "tokens/period"
@@ -54,7 +56,8 @@ def coverage_text(report: UsageReport) -> str:
     if gaps:
         parts.append("歷史涵蓋不完整（以下為全部已掃描來源）：\n" + "\n".join(gaps))
     parts.append("快取輸入已含於輸入；推理已含於輸出。— 代表來源未提供完整明細，不是零。")
-    parts.append("用量不換算訂閱額度或費用；未下載到本機的其他裝置／雲端紀錄不包含在內。")
+    parts.append("用量不換算訂閱額度或實際帳單；未下載到本機的其他裝置／雲端紀錄不包含在內。")
+    parts.append(pricing_description(report.api_cost_usd, report.priced_responses, report.responses))
     return "\n".join(parts)
 
 
@@ -212,6 +215,7 @@ class TokenUsagePanel(QFrame):
             #tokenCard QLabel { border: 0; background: transparent; color: #CBD5E1; font-size: 12px; }
             #tokenCard #tokenTitle { color: #F8FAFC; font-size: 13px; font-weight: 700; }
             #tokenCard #tokenTotal { color: #86EDC5; font-size: 25px; font-weight: 700; padding: 3px 0; }
+            #tokenCard #tokenCost { color: #B8DACF; font-size: 13px; padding-bottom: 3px; }
             #tokenCard #effortBadge { color: #A5C7ED; background: #203249; border-radius: 4px;
                 padding: 1px 5px; font-size: 10px; }
             #tokenCard QProgressBar { border: 0; border-radius: 1px; background: #243247; }
@@ -251,6 +255,10 @@ class TokenUsagePanel(QFrame):
         self.total = OdometerLabel("— Token")
         self.total.setObjectName("tokenTotal")
         layout.addWidget(self.total)
+        self.cost = OdometerLabel("API 等值（USD） —")
+        self.cost.setObjectName("tokenCost")
+        self.cost.setAccessibleName("API 等值費用，美元估算")
+        layout.addWidget(self.cost)
         self.rows = []
         self.row_details = []
         for _ in range(3):
@@ -302,6 +310,8 @@ class TokenUsagePanel(QFrame):
         self.settings.sync()
         # Do not label a previous period's totals as the newly selected period.
         self.total.setText("讀取中…")
+        self.cost.setText("API 等值（USD） 讀取中…")
+        self.cost.setToolTip("")
         for row, _, _ in self.rows:
             row.hide()
         self.more.setText("")
@@ -317,6 +327,10 @@ class TokenUsagePanel(QFrame):
         self._error = ""
         self.total.setText(f"{compact_tokens(report.total_tokens)} Token" if report.first_at is not None else "— Token")
         self.total.setToolTip(f"{report.total_tokens:,} Token · {report.responses:,} 次回應")
+        self.cost.setText("API 等值 " + format_cost(report.api_cost_usd, report.priced_responses, report.responses))
+        detail = pricing_description(report.api_cost_usd, report.priced_responses, report.responses)
+        self.cost.setToolTip(detail)
+        self.cost.setAccessibleDescription(detail)
         for index, (row, name, value) in enumerate(self.rows):
             show = index < min(len(report.groups), self.row_limit)
             row.setVisible(show)
@@ -465,7 +479,7 @@ class TokenDetailsDialog(QDialog):
         metrics = QHBoxLayout()
         metrics.setSpacing(12)
         self.metrics = []
-        for index, (label, hint) in enumerate((("總 Token", "輸入 + 輸出"), ("輸入 Token", "包含快取輸入"), ("輸出 Token", "包含推理 Token"))):
+        for index, (label, hint) in enumerate((("總 Token", "輸入 + 輸出"), ("輸入 Token", "包含快取輸入"), ("輸出 Token", "包含推理 Token"), ("API 等值（USD）", "Standard 估算 · 非實際帳單"))):
             card = QFrame()
             card.setObjectName("primaryMetric" if index == 0 else "metricCard")
             card_layout = QVBoxLayout(card)
@@ -481,6 +495,9 @@ class TokenDetailsDialog(QDialog):
                 card_layout.addWidget(child)
             metrics.addWidget(card, 1)
             self.metrics.append(number)
+            if index == 3:
+                number.setStyleSheet("font-size: 22px; color: #85E8BE;")
+                self.cost_hint = note
         layout.addLayout(metrics)
         section = QHBoxLayout()
         self.group_heading = OdometerLabel("模型與推理強度")
@@ -491,7 +508,8 @@ class TokenDetailsDialog(QDialog):
         self.advanced.toggled.connect(self._toggle_advanced)
         section.addWidget(self.advanced)
         layout.addLayout(section)
-        self.groups = self._table(["模型", "強度", "輸入", "輸出", "總 Token", "快取輸入¹", "快取寫入¹", "推理²"])
+        self.groups = self._table(["模型", "強度", "輸入", "輸出", "總 Token", "快取輸入¹", "快取寫入¹", "推理²", "API 等值（USD）"])
+        self.groups.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         self.groups.setAccessibleName("各模型與推理強度用量")
         self._toggle_advanced(False)
         self.groups.itemSelectionChanged.connect(self._select_group)
@@ -499,8 +517,9 @@ class TokenDetailsDialog(QDialog):
         self.turn_title = QLabel("選擇模型與強度，查看各回合用量")
         self.turn_title.setObjectName("sectionTitle")
         layout.addWidget(self.turn_title)
-        self.turn_table = self._table(["時間（台灣）", "回合", "輸入", "輸出", "總 Token", "回應次數"])
+        self.turn_table = self._table(["時間（台灣）", "回合", "輸入", "輸出", "總 Token", "回應次數", "API 等值（USD）"])
         self.turn_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.turn_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         self.turn_table.setAccessibleName("選取模型的各回合用量")
         self.turn_table.setMinimumHeight(90)
         layout.addWidget(self.turn_table, 1)
@@ -586,6 +605,8 @@ class TokenDetailsDialog(QDialog):
         self.groups.setRowCount(0)
         self.turn_table.setRowCount(0)
         self.summary.setText("讀取中…")
+        for label in self.metrics:
+            label.setText("—")
         self.panel.period.setCurrentIndex(self.panel.period.findData(self.period.currentData()))
 
     def apply_report(self, report):
@@ -598,6 +619,9 @@ class TokenDetailsDialog(QDialog):
                              f"本機已記錄用量 · {len(report.groups)} 個組合 · {report.responses:,} 次回應")
         for label, value in zip(self.metrics, (report.total_tokens, sum(g.input_tokens for g in report.groups), sum(g.output_tokens for g in report.groups))):
             label.setText(full_number(value))
+        self.metrics[3].setText(format_cost(report.api_cost_usd, report.priced_responses, report.responses).replace("（部分）", ""))
+        self.metrics[3].setToolTip(pricing_description(report.api_cost_usd, report.priced_responses, report.responses))
+        self.cost_hint.setText("僅部分回應可估算 · 查看說明" if report.priced_responses < report.responses else "Standard 估算 · 非實際帳單")
         self.group_heading.setText(f"模型與推理強度  ·  {len(report.groups)} 組")
         self.groups.blockSignals(True)
         self.groups.setRowCount(len(report.groups))
@@ -605,12 +629,16 @@ class TokenDetailsDialog(QDialog):
         for index, group in enumerate(report.groups):
             cells = [display_model(group.model), group.effort.title() or "未知強度",
                      *[full_number(getattr(group, k)) for k in ("input_tokens", "output_tokens", "total_tokens",
-                         "cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens")]]
+                         "cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens")],
+                     format_cost(group.api_cost_usd, group.priced_responses, group.responses)]
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setToolTip(text)
                 if column == 0:
                     item.setToolTip(group.model or "未知模型")
+                if column == 8:
+                    item.setToolTip(pricing_description(group.api_cost_usd, group.priced_responses, group.responses))
+                    item.setForeground(QColor("#85E8BE"))
                 if column == 1:
                     item.setForeground(QColor("#9BC4F5"))
                 if column >= 2:
@@ -671,6 +699,8 @@ class TokenDetailsDialog(QDialog):
         self.summary.setText("讀取中…")
         for label in self.metrics:
             label.setText("—")
+            label.setToolTip("")
+        self.cost_hint.setText("Standard 估算 · 非實際帳單")
         self.coverage.clear()
         self.previous.setEnabled(False)
         self.next.setEnabled(False)
@@ -706,10 +736,14 @@ class TokenDetailsDialog(QDialog):
         for index, row in enumerate(rows):
             cells = [datetime.fromtimestamp(row["first_at"], TAIWAN_TZ).strftime("%Y/%m/%d %H:%M:%S"),
                      row["turn_id"][:12] or "未知回合", *[full_number(row[k]) for k in
-                     ("input_tokens", "output_tokens", "total_tokens", "responses")]]
+                     ("input_tokens", "output_tokens", "total_tokens", "responses")],
+                     format_cost(row["api_cost_usd"], row["priced_responses"], row["responses"])]
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setToolTip(f"對話：{row['thread_id']}\n回合：{row['turn_id']}" if column == 1 else text)
+                if column == 6:
+                    item.setToolTip(pricing_description(row["api_cost_usd"], row["priced_responses"], row["responses"]))
+                    item.setForeground(QColor("#85E8BE"))
                 if column >= 2:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                     item.setData(KEY_ROLE, repr((self.report.period, self._selected, row['thread_id'], row['turn_id'], column)))
@@ -730,5 +764,12 @@ def demo_report(period="today") -> UsageReport:
         UsageGroup("gpt-5.6-luna", "high", 641000, 113000, 754000, 384000, 0, 64000, 17, 6),
         UsageGroup("gpt-5.6-sol", "low", 328000, 29000, 357000, 128000, 0, 4000, 9, 4),
     )
+    # 展示資料假設各組由等量短回應組成，避免拿整日總量套長上下文費率。
+    groups = tuple(replace(group, priced_responses=group.responses,
+        api_cost_usd=sum(estimate_response_usd(group.model,
+            group.input_tokens // group.responses + (index < group.input_tokens % group.responses),
+            group.cached_input_tokens // group.responses + (index < group.cached_input_tokens % group.responses),
+            0, group.output_tokens // group.responses + (index < group.output_tokens % group.responses))
+            for index in range(group.responses))) for group in groups)
     now = datetime.now(TAIWAN_TZ).timestamp()
     return UsageReport(period, groups, sum(g.total_tokens for g in groups), 89, now, now, {}, 4, now)

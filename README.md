@@ -2,9 +2,9 @@
 
 Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude Code 剩餘額度、依模型與推理強度追蹤 Codex 本機 Token 用量，並將常用指令一鍵貼到目前使用的 AI 工具。
 
-**目前正式版：v1.4.3** · Windows x64 · 繁體中文 · 不需安裝 Python
+**目前正式版：v1.4.4** · Windows x64 · 繁體中文 · 不需安裝 Python
 
-[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.3 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.3) · [驗證紀錄](驗證紀錄.md)
+[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.4 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.4) · [驗證紀錄](驗證紀錄.md)
 
 <img src="token-preview.png" width="340" alt="Quota PromptDock 主畫面；數字與指令為示範資料">
 
@@ -14,6 +14,7 @@ Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude C
 |---|---|
 | 額度資訊 | Codex／Claude Code 的已用與剩餘百分比、進度條、重置時間 |
 | Codex Token 用量 | 依模型 × 推理強度彙總，支援日期篩選與各回合明細 |
+| API 等值費用 | 依 Standard API 單價顯示美元估算，支援區間、模型及各回合對照 |
 | 常用指令 | 內建 11 個指令，可新增、編輯、排序及一鍵貼上 |
 | 數字動畫 | 統計數值改變時播放 Odometer 數字滾動動畫 |
 | 桌面操作 | 視窗置頂、系統匣、側邊懸浮圖示、額度提醒與開機啟動 |
@@ -77,12 +78,24 @@ Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude C
 
 ### 統計範圍與缺漏
 
-這是 **「本機已記錄用量」**，不等於所有裝置或整個帳號的用量，不換算訂閱額度百分比或費用。目前不包含 Claude Token 統計及跨裝置同步。
+這是 **「本機已記錄用量」**，不等於所有裝置或整個帳號的用量，不換算訂閱額度百分比或實際帳單。目前不包含 Claude Token 統計及跨裝置同步。
 
 - 只有舊版 `token_count` 累計事件的紀錄不回推、不納入逐次總量。
 - 缺少模型／強度、設定衝突或可辨識但無法歸屬的模型轉送，列為未知分類。未記錄的服務端轉送無法保證辨識。
 - 同一回應 ID 的用量互相衝突時，排除該回應並標示。缺少必要用量、格式損壞或過大的紀錄行不當成零。
 - `—` 表示缺少可核對資料或完整明細，不是零。來源格式變動、暫時鎖定或讀取失敗時保留已有統計並顯示狀態。
+
+### API 等值費用（v1.4.4）
+
+Token 小卡與明細視窗顯示 **API 等值美元估算**，模型列、各回合列也可對照費用，並隨日期區間一起切換。這是以 API 單價衡量相同用量的成本，不是訂閱費或實際 API 帳單。
+
+<img src="docs/api-cost-preview.png" width="340" alt="v1.4.4 API 等值美元估算；數字為示範資料">
+
+- 價格表於 **2026-09-16** 核對 [OpenAI 官方 Standard 價格](https://developers.openai.com/api/docs/pricing)，涵蓋 GPT-6 Astra、GPT-5.6 Sol／Terra／Luna 與 [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5)。歷史用量統一以此價格比較；更新內建價格表需更新程式。
+- 每次回應分別計算一般輸入、快取讀取、快取寫入及輸出費用，之後才按模型、回合及日期加總。快取從一般輸入扣除；推理已含在輸出，不再次計費。
+- 單次輸入超過 272,000 Token 時，輸入與快取費率乘 2、輸出費率乘 1.5；不以整日或整回合的累計 Token 判斷。
+- 模型單價未知、必要快取明細缺漏或明細不一致時不猜價。部分回應可估算時標示「部分」，全部不可估算顯示「無法估算」，無回應顯示 `—`；小於一美分但大於零時顯示 `< US$0.01`。
+- 不包含 Fast／Priority 加價、Batch／Flex 折扣、地區加價、工具費及稅金。滑鼠停在金額上，或開啟「統計範圍與說明」，可查看計算規則、涵蓋回應數及來源。
 
 ## Odometer 數字滾動動畫
 

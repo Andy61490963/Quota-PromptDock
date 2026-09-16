@@ -55,10 +55,13 @@ def test_summary_top_three_total_includes_other_models_and_period_persistence(qa
     report = tp.demo_report()
     panel.apply_report(report)
     assert panel.total.text() == "4.07M Token"
+    assert panel.cost.text() == "API 等值 約 US$7.61"
+    assert "89 / 89" in panel.cost.toolTip()
     assert panel.more.text() == "另有 1 組"
     assert len([r for r, _, _ in panel.rows if not r.isHidden()]) == 3
     panel.period.setCurrentIndex(panel.period.findData("week"))
     assert panel.total.text() == "讀取中…"
+    assert panel.cost.text() == "API 等值（USD） 讀取中…"
     panel.apply_report(report)
     assert panel.total.text() == "讀取中…"  # late result from a previous selection
     panel.apply_report(replace(report, period="week", total_tokens=123456))
@@ -148,7 +151,7 @@ def test_small_screen_panel_and_command_actions_remain_reachable(widget, height,
     QTest.qWait(60)
     panel = widget.token_panel
     assert panel.row_limit == rows
-    for target in (panel.total, panel.details, widget.refresh_button):
+    for target in (panel.total, panel.cost, panel.details, widget.refresh_button):
         assert widget.rect().contains(target.mapTo(widget, target.rect().bottomRight()))
     assert panel.height() >= panel.minimumSizeHint().height()
     for i in range(8):
@@ -229,6 +232,9 @@ def test_details_preserves_selection_on_reorder_and_exposes_optional_counters(wi
     assert not dialog.groups.isColumnHidden(5)
     assert not dialog.legend.isHidden()
     assert dialog.metrics[0].text() == f"{report.total_tokens:,}"
+    assert dialog.metrics[3].text() == "約 US$7.61"
+    assert not dialog.groups.isColumnHidden(8)
+    assert "US$" in dialog.groups.item(0, 8).text()
 
 
 def test_new_group_query_clears_previous_turn_rows(widget):
@@ -277,6 +283,7 @@ def test_worker_hidden_collection_detail_queries_and_ui_responsiveness(qapp, tmp
         assert panel.dialog.groups.item(0, 4).text() == "240"
         assert panel.dialog.turn_table.item(0, 4).text() == "240"
         assert panel.dialog.turn_table.item(0, 5).text() == "2"
+        assert panel.dialog.turn_table.item(0, 6).text() == "< US$0.01"
     finally:
         timer.stop()
         service.stop()
@@ -284,3 +291,20 @@ def test_worker_hidden_collection_detail_queries_and_ui_responsiveness(qapp, tmp
             panel.dialog.close()
         panel.close()
     assert not service._thread.is_alive()
+
+
+def test_partial_and_unknown_costs_are_explicit_and_reset_with_period(widget):
+    panel = widget.token_panel
+    report = tp.demo_report()
+    unknown = replace(report.groups[0], model="unknown", api_cost_usd=0, priced_responses=0)
+    panel.apply_report(replace(report, groups=(unknown, *report.groups[1:])))
+    panel.open_details()
+    assert "部分" in panel.cost.text()
+    assert "部分" in panel.dialog.cost_hint.text()
+    assert panel.dialog.groups.item(0, 8).text() == "無法估算"
+    assert "未涵蓋部分不視為零" in panel.dialog.metrics[3].toolTip()
+    panel.period_changed.disconnect()
+    panel.period.setCurrentIndex(panel.period.findData("week"))
+    assert "讀取中" in panel.cost.text()
+    assert panel.dialog.metrics[3].text() == "—"
+    assert panel.dialog.metrics[3].toolTip() == ""
