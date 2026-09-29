@@ -31,6 +31,9 @@ def verify_release_tag(tag: str, source: Path = APP_SOURCE) -> None:
 
 
 if __name__ == "__main__":
+    # Windows 發布環境可能使用 cp1252；固定 UTF-8，避免繁體中文訊息中止流程。
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
     try:
         verify_release_tag(sys.argv[1] if len(sys.argv) == 2 else "")
     except ValueError as exc:
