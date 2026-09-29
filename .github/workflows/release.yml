@@ -26,14 +26,14 @@ jobs:
           cache-dependency-path: requirements-lock.txt
 
       - name: 核對標籤與程式版本
-        shell: powershell
+        shell: pwsh
         run: python tools/check_release_version.py $env:GITHUB_REF_NAME
 
       - name: 安裝固定依賴
         run: python -m pip install -r requirements-lock.txt
 
       - name: 測試、打包並驗證執行檔
-        shell: powershell
+        shell: pwsh
         run: .\build_release.ps1
 
       - name: 保留已驗證的發布產物
@@ -61,7 +61,7 @@ jobs:
           path: release
 
       - name: 建立或更新待審核發行草稿
-        shell: powershell
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
