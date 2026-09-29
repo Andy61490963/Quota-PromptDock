@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 from datetime import datetime, timezone
 
@@ -51,8 +52,8 @@ def report(store, period="all"):
     return store.report(period, NOW)
 
 
-def scan(collector):
-    return list(collector.scan())
+def scan(collector, **kwargs):
+    return list(collector.scan(**kwargs))
 
 
 def test_model_effort_switches_versions_future_models_and_multiple_responses(ledger):
@@ -93,6 +94,49 @@ def test_refresh_restart_archive_copy_and_new_response_are_idempotent(ledger):
     archived.unlink()
     scan(collector)
     assert report(store).total_tokens == 240
+
+
+def test_unchanged_source_skips_file_open_and_report_change(ledger, monkeypatch):
+    store, collector, path = ledger
+    write(path, [meta(), context(), response()])
+    assert any(progress.changed for progress in scan(collector))
+    monkeypatch.setattr(tu, "open_shared", lambda path: pytest.fail("未變檔案不應重新開啟"))
+    assert not any(progress.changed for progress in scan(collector))
+    assert report(store).total_tokens == 120
+
+
+def test_audit_detects_same_size_rewrite_with_preserved_mtime(ledger):
+    store, collector, path = ledger
+    padding = event("response_item", {"content": "x" * 4000})
+    write(path, [meta(), context(), padding, response(), padding])
+    scan(collector)
+    before = path.stat()
+    original = path.read_bytes()
+    rewritten = original.replace(b'"output_tokens": 20', b'"output_tokens": 30', 1).replace(
+        b'"total_tokens": 120', b'"total_tokens": 130', 1)
+    assert rewritten != original and len(rewritten) == len(original)
+    path.write_bytes(rewritten)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino, before.st_size, before.st_mtime_ns)
+    assert not any(progress.changed for progress in scan(collector))
+    assert report(store).responses == 1
+    assert any(progress.changed for progress in scan(collector, audit=True))
+    assert report(store).issues["conflict"] == 1
+    assert report(store).responses == 0
+
+
+def test_appending_irrelevant_record_does_not_mark_usage_changed(ledger):
+    _, collector, path = ledger
+    write(path, [meta(), context(), response()])
+    scan(collector)
+    write(path, [event("response_item", {"content": "不應儲存或更新統計"})], "a")
+    progress = scan(collector)
+    assert progress[-1].bytes_read > 0
+    assert not any(item.changed for item in progress)
+    write(path, [response("second")], "a")
+    assert any(item.changed for item in scan(collector))
 
 
 def test_null_details_unknown_context_and_late_context(ledger):
@@ -152,7 +196,7 @@ def test_ambiguous_turn_attribution_is_unknown(ledger, marker):
     assert result.issues["unknown"] == 1
 
 
-def test_partial_line_and_malformed_complete_line(ledger):
+def test_partial_line_and_malformed_complete_line(ledger, monkeypatch):
     store, collector, path = ledger
     write(path, [meta(), context()])
     original = path.stat().st_size
@@ -162,6 +206,10 @@ def test_partial_line_and_malformed_complete_line(ledger):
     scan(collector)
     with store.connection() as db:
         assert db.execute("SELECT offset FROM sources").fetchone()[0] == original
+    original_open = tu.open_shared
+    monkeypatch.setattr(tu, "open_shared", lambda path: pytest.fail("未增加的未完成行不應重新開啟"))
+    assert not any(progress.changed for progress in scan(collector))
+    monkeypatch.setattr(tu, "open_shared", original_open)
     with path.open("ab") as f:
         f.write(raw[40:] + b"\nnot json\n")
     scan(collector)
@@ -174,6 +222,7 @@ def test_read_error_retries_and_preserves_totals(ledger, monkeypatch):
     store, collector, path = ledger
     write(path, [meta(), context(), response()])
     scan(collector)
+    write(path, [response("second")], "a")
     original = tu.open_shared
     monkeypatch.setattr(tu, "open_shared", lambda p: (_ for _ in ()).throw(PermissionError()))
     scan(collector)
@@ -181,6 +230,7 @@ def test_read_error_retries_and_preserves_totals(ledger, monkeypatch):
     monkeypatch.setattr(tu, "open_shared", original)
     scan(collector)
     assert report(store).issues["read_errors"] == 0
+    assert report(store).total_tokens == 240
 
 
 def test_transaction_rollback_and_resume(ledger, monkeypatch):

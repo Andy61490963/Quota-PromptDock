@@ -75,9 +75,13 @@ class TokenUsageService(QObject):
         self._wake = threading.Event()
         self._lock = threading.Lock()
         self._refresh = True
+        self._audit_requested = False
         self._query = True
         self._turn_query = None
         self._thread = None
+        self._last_report = None
+        self._report_day = None
+        self._had_failure = False
 
     def start(self):
         if self._thread is None:
@@ -90,9 +94,10 @@ class TokenUsageService(QObject):
         if self._thread:
             self._thread.join(timeout=2)
 
-    def refresh(self):
+    def refresh(self, *, audit=False):
         with self._lock:
             self._refresh = True
+            self._audit_requested = self._audit_requested or audit
         self._wake.set()
 
     def set_period(self, period):
@@ -108,52 +113,87 @@ class TokenUsageService(QObject):
             self._turn_query = request
         self._wake.set()
 
+    @staticmethod
+    def _today():
+        return datetime.now(TAIWAN_TZ).date()
+
     def _publish(self, store, force=False):
         with self._lock:
             period, query, turns = self._period, self._query, self._turn_query
             self._query = False
             self._turn_query = None
-        if force or query:
-            self.report_ready.emit(store.report(period))
-        if turns:
-            request_id, period, model, effort, page = turns
-            rows, count = store.turns(period, model, effort, page)
-            self.turns_ready.emit((request_id, rows, count))
+        try:
+            day = self._today()
+            if force or query or day != self._report_day:
+                report = store.report(period)
+                self._report_day = day
+                # updated_at 是查詢時間；內容相同時不重建主畫面及明細表格。
+                if (self._last_report is None or
+                        replace(self._last_report, updated_at=report.updated_at) != report):
+                    self._last_report = report
+                    self.report_ready.emit(report)
+            if turns:
+                request_id, period, model, effort, page = turns
+                rows, count = store.turns(period, model, effort, page)
+                self.turns_ready.emit((request_id, rows, count))
+        except Exception:
+            # 查詢失敗時保留請求，修復後下次喚醒仍會重試。
+            with self._lock:
+                self._query = True
+                if turns and self._turn_query is None:
+                    self._turn_query = turns
+            raise
 
     def _run(self):
         # The worker owns every database read/write, including detail queries.
         store = None
-        next_scan = next_discovery = 0.0
+        next_scan = next_discovery = next_audit = 0.0
         while not self._stop.is_set():
             self._wake.clear()
+            audit_requested = False
             try:
                 if store is None:
                     store = TokenUsageStore(self.path)
                 collector = TokenUsageCollector(store, self.root)
                 with self._lock:
                     refresh, self._refresh = self._refresh, False
+                    audit_requested, self._audit_requested = self._audit_requested, False
                 self._publish(store)
                 now = time.monotonic()
                 if refresh or now >= next_scan:
                     discover = refresh or now >= next_discovery
+                    audit = audit_requested or now >= next_audit
                     if discover:
                         next_discovery = now + 60
                     last_publish = last_progress = 0.0
+                    changed = False
                     self.progress.emit((True, 0, 0))
-                    for progress in collector.scan(discover, self._stop):
+                    for progress in collector.scan(discover, self._stop, audit=audit):
                         now = time.monotonic()
+                        changed = changed or progress.changed
                         if now - last_progress >= 0.25:
                             self.progress.emit((True, progress.completed, progress.files))
                             last_progress = now
-                        self._publish(store, force=now - last_publish >= 1)
-                        if now - last_publish >= 1:
+                        publish_changed = changed and now - last_publish >= 1
+                        self._publish(store, force=publish_changed)
+                        if publish_changed:
+                            changed = False
                             last_publish = now
                     if not self._stop.is_set():
-                        self._publish(store, force=True)
+                        self._publish(store, force=changed)
                         self.progress.emit((False, 0, 0))
+                        if audit:
+                            next_audit = time.monotonic() + 3600
+                        if self._had_failure:
+                            self._had_failure = False
+                            self.failed.emit("")
                     next_scan = time.monotonic() + 10
             except Exception:
                 # Never display raw log data or exception paths in the interface.
+                with self._lock:
+                    self._query = True
+                    self._audit_requested = self._audit_requested or audit_requested
+                self._had_failure = True
                 self.failed.emit("Token 用量更新失敗，已保留上次結果；10 秒後重試。")
                 self.progress.emit((False, 0, 0))
                 next_scan = time.monotonic() + 10
@@ -320,8 +360,12 @@ class TokenUsagePanel(QFrame):
         self.period_changed.emit(self.period.currentData())
         self.layout_changed.emit()
 
-    def apply_report(self, report: UsageReport):
+    def apply_report(self, report: UsageReport, *, force=False):
         if report.period != self.period.currentData():
+            return
+        if (not force and not self._error and self.report is not None and
+                replace(self.report, updated_at=report.updated_at) == report):
+            self.report = report
             return
         self.report = report
         self._error = ""
@@ -357,7 +401,7 @@ class TokenUsagePanel(QFrame):
             self.row_limit = limit
             if self.report:
                 previous_error = self._error
-                self.apply_report(self.report)
+                self.apply_report(self.report, force=True)
                 if previous_error:
                     self.set_error(previous_error)
 
@@ -610,6 +654,10 @@ class TokenDetailsDialog(QDialog):
         self.panel.period.setCurrentIndex(self.panel.period.findData(self.period.currentData()))
 
     def apply_report(self, report):
+        if (self.report is not None and
+                replace(self.report, updated_at=report.updated_at) == report):
+            self.report = report
+            return
         changed = not self.report or self.report.period != report.period
         self.report = report
         self.period.blockSignals(True)
@@ -662,7 +710,7 @@ class TokenDetailsDialog(QDialog):
         self.coverage.setAccessibleDescription(detail)
         if selected_row >= 0:
             self.groups.selectRow(selected_row)
-            self._query_turns()
+            self._query_turns(clear=changed)
         elif report.groups:
             group = report.groups[0]
             self._selected = (group.model, group.effort)
@@ -713,16 +761,18 @@ class TokenDetailsDialog(QDialog):
         self._page = max(0, self._page + delta)
         self._query_turns()
 
-    def _query_turns(self):
+    def _query_turns(self, *, clear=True):
         if not self._selected or not self.report:
             return
         self._request_id += 1
-        self.turn_table.setRowCount(0)
-        self.page_label.setText("讀取回合紀錄…")
+        if clear:
+            self.turn_table.setRowCount(0)
+            self.page_label.setText("讀取回合紀錄…")
         self.turn_title.setText(f"各回合紀錄  /  {display_model(self._selected[0])} · {self._selected[1].title() or '未知強度'}")
         self.turn_title.setTextFormat(Qt.TextFormat.PlainText)
-        self.previous.setEnabled(False)
-        self.next.setEnabled(False)
+        if clear:
+            self.previous.setEnabled(False)
+            self.next.setEnabled(False)
         if self.panel.service:
             self.panel.service.request_turns((self._request_id, self.report.period, *self._selected, self._page))
         else:
@@ -731,6 +781,11 @@ class TokenDetailsDialog(QDialog):
     def _show_turns(self, result):
         request_id, rows, count = result
         if request_id != self._request_id:
+            return
+        pages = max(1, (count + 99) // 100)
+        if self._page >= pages:
+            self._page = pages - 1
+            self._query_turns(clear=False)
             return
         self.turn_table.setRowCount(len(rows))
         for index, row in enumerate(rows):
@@ -750,7 +805,6 @@ class TokenDetailsDialog(QDialog):
                 if column == 4:
                     item.setForeground(QColor("#85E8BE"))
                 self.turn_table.setItem(index, column, item)
-        pages = max(1, (count + 99) // 100)
         self.turn_table.itemDelegate().animate_items()
         self.page_label.setText(f"共 {count:,} 回合  ·  第 {self._page + 1} / {pages} 頁" if count else "此區間沒有可顯示的回合紀錄")
         self.previous.setEnabled(self._page > 0)

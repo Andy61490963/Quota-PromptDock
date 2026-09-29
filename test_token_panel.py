@@ -1,10 +1,11 @@
 import time
 from dataclasses import replace
+from datetime import date
 
 import pytest
 from PySide6.QtCore import QPoint, QSettings, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QLabel, QTableWidgetItem
 
 import app
 import prompt_tools as pt
@@ -31,7 +32,8 @@ def widget(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(app, "PasteController", lambda parent: pt.PasteController(parent, target=FakeTarget()))
     w = app.UsageWidget(demo=True)
     w.show()
-    QTest.qWait(150)
+    until(lambda: w._snapshot is not None and w._claude_snapshot is not None)
+    qapp.processEvents()
     yield w
     if w.token_panel.dialog:
         w.token_panel.dialog.close()
@@ -250,13 +252,87 @@ def test_new_group_query_clears_previous_turn_rows(widget):
     assert not dialog.previous.isEnabled() and not dialog.next.isEnabled()
 
 
+def test_identical_report_keeps_detail_items_and_selected_page(widget):
+    panel = widget.token_panel
+    panel.open_details()
+    dialog = panel.dialog
+    requests = []
+    panel.service = type("PendingService", (), {"request_turns": lambda self, request: requests.append(request)})()
+    dialog._page = 1
+    dialog.turn_table.setRowCount(1)
+    old_turn = QTableWidgetItem("原有明細")
+    dialog.turn_table.setItem(0, 0, old_turn)
+    old_group = dialog.groups.item(0, 0)
+    current = panel.report
+    layouts = []
+    panel.layout_changed.connect(lambda: layouts.append(True))
+    panel.apply_report(replace(current, updated_at=current.updated_at + 60))
+    assert dialog.groups.item(0, 0) is old_group
+    assert dialog.turn_table.item(0, 0) is old_turn
+    assert dialog._page == 1 and not requests and not layouts
+
+    first = current.groups[0]
+    changed = replace(current, groups=(replace(first, total_tokens=first.total_tokens + 1), *current.groups[1:]),
+                      total_tokens=current.total_tokens + 1)
+    panel.apply_report(changed)
+    assert dialog._page == 1 and dialog._selected == (first.model, first.effort)
+    assert dialog.turn_table.item(0, 0) is old_turn
+    assert requests[-1][-1] == 1
+    dialog._show_turns((dialog._request_id, [], 89))
+    assert dialog._page == 0 and requests[-1][-1] == 0
+    assert dialog.turn_table.item(0, 0) is old_turn
+
+
+def test_service_queries_only_on_changes_period_or_day(qapp, tmp_path):
+    service = tp.TokenUsageService(tmp_path / "usage.sqlite3", "today")
+    today = [date(2026, 9, 29)]
+    service._today = lambda: today[0]
+    reports = []
+    service.report_ready.connect(reports.append)
+
+    class FakeStore:
+        calls = 0
+        report_value = tp.demo_report()
+        fail_next = False
+
+        def report(self, period):
+            self.calls += 1
+            if self.fail_next:
+                self.fail_next = False
+                raise OSError("暫時讀取失敗")
+            return replace(self.report_value, period=period, updated_at=float(self.calls))
+
+    store = FakeStore()
+    service._publish(store)
+    assert store.calls == 1 and len(reports) == 1
+    service._publish(store)
+    assert store.calls == 1 and len(reports) == 1
+    service._publish(store, force=True)
+    assert store.calls == 2 and len(reports) == 1
+    today[0] = date(2026, 9, 30)
+    store.report_value = replace(store.report_value, total_tokens=store.report_value.total_tokens + 1)
+    service._publish(store)
+    assert store.calls == 3 and len(reports) == 2
+    service.set_period("week")
+    service._publish(store)
+    assert store.calls == 4 and reports[-1].period == "week"
+    service.set_period("month")
+    store.fail_next = True
+    with pytest.raises(OSError):
+        service._publish(store)
+    service._publish(store)
+    assert reports[-1].period == "month"
+
+
 def test_worker_hidden_collection_detail_queries_and_ui_responsiveness(qapp, tmp_path, monkeypatch):
     root = tmp_path / "codex"
     path = root / "sessions" / "session.jsonl"
     write(path, [meta(), context(), response()])
     original = TokenUsageCollector.scan
-    def slow_scan(self, *args):
-        for progress in original(self, *args):
+    audits = []
+    def slow_scan(self, *args, **kwargs):
+        audits.append(kwargs.get("audit"))
+        for progress in original(self, *args, **kwargs):
             time.sleep(0.12)
             yield progress
     monkeypatch.setattr(TokenUsageCollector, "scan", slow_scan)
@@ -275,8 +351,12 @@ def test_worker_hidden_collection_detail_queries_and_ui_responsiveness(qapp, tmp
         until(lambda: panel.report is not None and panel.report.responses == 1 and panel._busy is None)
         assert len(ticks) >= 10 and panel.isHidden()
         write(path, [response("second")], "a")
-        service.refresh()
+        service.refresh(audit=True)
         until(lambda: panel.report.responses == 2 and panel._busy is None)
+        assert len(audits) >= 2 and audits[0] is True and audits[1] is True
+        service.refresh()
+        until(lambda: len(audits) >= 3 and panel._busy is None)
+        assert audits[2] is False
         panel.show()
         panel.open_details()
         until(lambda: panel.dialog.turn_table.rowCount() == 1)

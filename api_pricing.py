@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-PRICING_DATE = "2026-09-16"
+PRICING_DATE = "2026-09-29"
 PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 LONG_CONTEXT_THRESHOLD = 272_000
 
@@ -17,10 +17,12 @@ class ModelPrice:
     output_rate: int
 
 
-# 來源：官方價格頁，以及 https://developers.openai.com/api/docs/models/gpt-5.5。
+# 來源：官方價格頁及各模型頁（包含 gpt-6-sol、gpt-6-luna、gpt-5.5）。
 # 僅接受已核對的模型識別碼，未確認的模型不可套用其他模型的價格。
 MODEL_PRICES = {
     "gpt-6-astra": ModelPrice(10_000, 1_000, 12_500, 50_000),
+    "gpt-6-sol": ModelPrice(2_000, 200, 2_500, 10_000),
+    "gpt-6-luna": ModelPrice(100, 10, 125, 500),
     "gpt-5.6-sol": ModelPrice(4_000, 400, 5_000, 20_000),
     "gpt-5.6": ModelPrice(4_000, 400, 5_000, 20_000),
     "gpt-5.6-terra": ModelPrice(2_000, 200, 2_500, 12_000),

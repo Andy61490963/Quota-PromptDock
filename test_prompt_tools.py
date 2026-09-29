@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QPoint, QSettings, Qt
+from PySide6.QtCore import QPoint, QSettings, Qt, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox
 
@@ -199,14 +199,113 @@ def test_panel_more_empty_and_keyboard_focus(qapp, tmp_path):
     panel.show()
     QTest.qWait(30)
     assert panel.grid.count() == 8
+    dialogs = []
+    def cancel_picker():
+        picker = QApplication.activeModalWidget()
+        dialogs.append(picker)
+        picker.reject()
+    QTimer.singleShot(0, cancel_picker)
     QTest.mouseClick(panel.more, Qt.MouseButton.LeftButton)
-    assert panel.grid.count() == 11
+    assert isinstance(dialogs[0], pt.PromptPicker)
+    assert dialogs[0].results.count() == 11
+    assert panel.grid.count() == 8
+    qapp.processEvents()
     panel.edit_button.setFocus()
     assert panel.edit_button.hasFocus()
     panel.prompts = []
     panel.rebuild()
     QTest.qWait(30)
     assert panel.grid.count() == 1 and not panel.more.isVisible()
+    panel.close()
+
+
+def test_picker_searches_title_and_body_and_keeps_selection(qapp):
+    rows = [pt.Prompt("a", "Alpha", "foo"), pt.Prompt("b", "Beta", "foo bar"),
+            pt.Prompt("c", "Gamma", "bar")]
+    picker = pt.PromptPicker(rows, app.DIALOG_STYLE)
+    picker.show()
+    picker.search.setFocus()
+    picker.search.setText("foo")
+    assert picker.results.count() == 2 and picker.preview.toPlainText() == "foo"
+    QTest.keyClick(picker.search, Qt.Key.Key_Down)
+    assert picker.results.currentItem().data(Qt.ItemDataRole.UserRole) == "b"
+    assert picker.preview.toPlainText() == "foo bar"
+    QTest.keyClick(picker.search, Qt.Key.Key_Up)
+    assert picker.results.currentItem().data(Qt.ItemDataRole.UserRole) == "a"
+    picker.results.setFocus()
+    QTest.keyClick(picker.results, Qt.Key.Key_Down)
+    assert picker.results.currentItem().data(Qt.ItemDataRole.UserRole) == "b"
+    picker.search.setText("bar")
+    assert picker.results.count() == 2
+    assert picker.results.currentItem().data(Qt.ItemDataRole.UserRole) == "b"
+    picker.search.setText("Gamma")
+    assert picker.results.count() == 1 and picker.preview.toPlainText() == "bar"
+    picker.search.setText("不存在")
+    assert picker.results.count() == 0 and picker.preview.toPlainText() == ""
+    assert not picker.confirm.isEnabled() and "找不到" in picker.status.text()
+    QTest.keyClick(picker.search, Qt.Key.Key_Escape)
+    assert picker.result() == QDialog.DialogCode.Rejected and picker.chosen is None
+
+
+def test_picker_requires_explicit_confirmation_before_paste(qapp, tmp_path):
+    target = FakeTarget()
+    controller = pt.PasteController(target=target)
+    panel = pt.PromptPanel(pt.PromptStore(tmp_path / "prompts.json"), controller, app.DIALOG_STYLE)
+    panel.show()
+    QApplication.clipboard().setText("原有剪貼簿")
+    states = []
+
+    def cancel_after_selection():
+        picker = QApplication.activeModalWidget()
+        picker.search.setText("SQL")
+        states.append((picker.results.count(), picker.preview.toPlainText(), QApplication.clipboard().text()))
+        QTest.keyClick(picker.search, Qt.Key.Key_Escape)
+
+    QTimer.singleShot(0, cancel_after_selection)
+    panel.more.click()
+    assert states[0][0] == 1 and "SQL" in states[0][1]
+    assert states[0][2] == QApplication.clipboard().text() == "原有剪貼簿"
+    assert not target.sent
+
+    def confirm_selected():
+        picker = QApplication.activeModalWidget()
+        picker.search.setText("SQL")
+        selected_body = picker.preview.toPlainText()
+        states.append(selected_body)
+        QTest.keyClick(picker.search, Qt.Key.Key_Return)
+        states.append(picker.focusWidget() is picker.confirm)
+        states.append(QApplication.clipboard().text())
+        picker.confirm.click()
+
+    QTimer.singleShot(0, confirm_selected)
+    panel.more.click()
+    QTest.qWait(150)
+    assert states[2] is True and states[3] == "原有剪貼簿"
+    assert QApplication.clipboard().text() == states[1]
+    assert target.sent == [123]
+    panel.close()
+
+
+def test_picker_uses_saved_edits_when_reopened(qapp, tmp_path):
+    store = pt.PromptStore(tmp_path / "prompts.json")
+    panel = pt.PromptPanel(store, pt.PasteController(target=FakeTarget()), app.DIALOG_STYLE)
+    panel.show()
+
+    def edit_first():
+        editor = QApplication.activeModalWidget()
+        editor.name.setText("新名稱")
+        editor.body.setPlainText("新內容可搜尋")
+        editor.save()
+
+    QTimer.singleShot(0, edit_first)
+    panel.edit()
+    assert store.load()[0].title == "新名稱"
+    picker = pt.PromptPicker(panel.prompts, app.DIALOG_STYLE, panel)
+    picker.search.setText("新內容")
+    assert picker.results.count() == 1
+    assert picker.preview_title.text() == "新名稱"
+    assert picker.preview.toPlainText() == "新內容可搜尋"
+    picker.close()
     panel.close()
 
 
@@ -423,6 +522,7 @@ def test_scale_change_requests_restart_only_after_accept(qapp, tmp_path, monkeyp
     monkeypatch.setattr(widget, "quit_app", lambda: quit_requests.append(True))
     class Dialog:
         settings_changed = widget.signals.login_finished
+        onboarding_requested = widget.signals.login_finished
         def __init__(self, settings, parent): self.settings = settings
         def exec(self):
             self.settings.setValue(app.UI_SCALE_SETTING, 125)
