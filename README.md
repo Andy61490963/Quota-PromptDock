@@ -2,11 +2,11 @@
 
 Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude Code 剩餘額度、依模型與推理強度追蹤 Codex 本機 Token 用量，並將常用指令一鍵貼到目前使用的 AI 工具。
 
-**目前正式版：v1.4.4** · Windows x64 · 繁體中文 · 不需安裝 Python
+**目前正式版：v1.4.5** · Windows x64 · 繁體中文 · 不需安裝 Python
 
-[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.4 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.4) · [驗證紀錄](驗證紀錄.md)
+[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.5 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.5) · [驗證紀錄](驗證紀錄.md)
 
-原始碼目前包含 **v1.4.5 待發布修訂**：首次使用引導、懸浮額度摘要、指令搜尋與預覽，以及 GPT-6 Sol／Luna 估價、更新校驗與回復、通知和背景效能修正。完整變更與測試方式見[驗證紀錄](驗證紀錄.md)。
+**v1.4.5 更新重點**：首次使用引導、懸浮額度摘要、指令搜尋與預覽，以及 GPT-6 Sol／Luna 估價、更新校驗與回復、通知和背景效能修正。完整變更見[版本說明](docs/發布說明-v1.4.5.md)，測試方式見[驗證紀錄](驗證紀錄.md)。
 
 <img src="token-preview.png" width="340" alt="Quota PromptDock 主畫面；數字與指令為示範資料">
 
