@@ -21,8 +21,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSettings, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPen
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -49,6 +49,8 @@ from odometer import DigitRoller, OdometerLabel
 from updates import UpdateChecker, parse_release, GITHUB_REPO, RELEASE_API, RELEASE_DOWNLOAD_PREFIX, RELEASE_ASSET
 from windows_install import install_windows_release, signal_startup_ready, set_frozen_autostart as _set_frozen_autostart
 from install_handoff import handoff_environment, wait_for_handoff, schedule_download_cleanup, discard_download
+from onboarding import OnboardingDialog
+from quota_summary import QuotaSummaryCard, QuotaSummaryRow
 
 
 APP_NAME = "Quota PromptDock"
@@ -107,6 +109,8 @@ def clamped_position(point: QPoint, size: QSize, area: QRect) -> QPoint:
 
 UPDATE_CHECK_SETTING = "check_updates"
 CODEX_RING_SETTING = "codex_ring"
+ONBOARDING_SEEN = "onboarding/seen"
+PROVIDERS = ("codex", "claude")
 # Codex 把 5 小時與 7 天分別放在 primary/secondary，但哪個在前面會變，
 # 所以一律用視窗長度認人；一天以內算短週期。
 SHORT_WINDOW_MAX_MINUTES = 24 * 60
@@ -1032,6 +1036,42 @@ class MiniUsageWidget(QWidget):
         self._provider = "無資料"
         self._stale = False
         self.roller.set_text("—")
+        self.summary = QuotaSummaryCard()
+        self._summary_timer = QTimer(self)
+        self._summary_timer.setSingleShot(True)
+        self._summary_timer.setInterval(250)
+        self._summary_timer.timeout.connect(self._show_summary)
+
+    def _show_summary(self) -> None:
+        if self.isVisible() and self._press_global is None:
+            self.summary.show_near(self.frameGeometry())
+
+    def event(self, event: Any) -> bool:
+        if event.type() == QEvent.Type.ToolTip:
+            self._show_summary()
+            return True
+        return super().event(event)
+
+    def _dismiss_summary(self) -> None:
+        self._summary_timer.stop()
+        self.summary.dismiss()
+
+    def enterEvent(self, event: Any) -> None:
+        self._summary_timer.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: Any) -> None:
+        self._dismiss_summary()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event: Any) -> None:
+        self._dismiss_summary()
+        super().hideEvent(event)
+
+    def closeEvent(self, event: Any) -> None:
+        self._dismiss_summary()
+        self.summary.close()
+        super().closeEvent(event)
 
     def set_usage(self, display: MiniUsageDisplay | None, source: str, stale: bool = False) -> None:
         self._remaining = None if display is None else max(0.0, min(100.0, display.remaining_percent))
@@ -1107,6 +1147,7 @@ class MiniUsageWidget(QWidget):
         self.owner.settings.setValue("mini_position", self.pos())
 
     def mousePressEvent(self, event: Any) -> None:
+        self._dismiss_summary()
         if event.button() == Qt.MouseButton.LeftButton:
             self._press_global = event.globalPosition().toPoint()
             self._start_position = self.pos()
@@ -1133,21 +1174,43 @@ class MiniUsageWidget(QWidget):
             event.accept()
 
     def keyPressEvent(self, event: Any) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self._dismiss_summary()
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+            if not self.summary.isVisible():
+                self._show_summary()
+            direction = -1 if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_PageUp) else 1
+            self.summary.scroll_by(direction, page=event.key() in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown))
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self._dismiss_summary()
             self.owner.expand_from_mini()
             event.accept()
             return
         super().keyPressEvent(event)
 
+    def wheelEvent(self, event: Any) -> None:
+        if self.summary.isVisible():
+            self.summary.scroll_by(-1 if event.angleDelta().y() > 0 else 1)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
     def focusInEvent(self, event: Any) -> None:
         super().focusInEvent(event)
+        self._show_summary()
         self.update()
 
     def focusOutEvent(self, event: Any) -> None:
         super().focusOutEvent(event)
+        self._dismiss_summary()
         self.update()
 
     def contextMenuEvent(self, event: Any) -> None:
+        self._dismiss_summary()
         menu = QMenu()
         show_action = menu.addAction("展開小工具")
         refresh_action = menu.addAction("立即更新")
@@ -1183,6 +1246,7 @@ class SettingsComboBox(QComboBox):
 
 class SettingsDialog(QDialog):
     settings_changed = Signal()
+    onboarding_requested = Signal()
 
     def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1283,6 +1347,7 @@ class SettingsDialog(QDialog):
             self.mini_source.addItem(label, value)
         source_value = str(settings.value("mini_source", "min"))
         self.mini_source.setCurrentIndex(max(0, self.mini_source.findData(source_value)))
+        self.sync_tracking_sources()
         layout.addWidget(self.mini_source)
 
         layout.addWidget(QLabel("主圓環顯示的 Codex 額度"))
@@ -1308,6 +1373,12 @@ class SettingsDialog(QDialog):
         self.check_updates.setChecked(_setting_bool(settings, UPDATE_CHECK_SETTING, True))
         layout.addWidget(self.check_updates)
 
+        self.connection_guide = QPushButton("連線與使用引導…")
+        self.connection_guide.setObjectName("secondaryButton")
+        self.connection_guide.setAccessibleName("選擇追蹤來源與查看連線說明")
+        self.connection_guide.clicked.connect(lambda checked=False: self.onboarding_requested.emit())
+        layout.addWidget(self.connection_guide)
+
         actions = QHBoxLayout()
         actions.addStretch()
         cancel = QPushButton("取消")
@@ -1319,6 +1390,15 @@ class SettingsDialog(QDialog):
         actions.addWidget(save)
         outer.addLayout(actions)
 
+    def sync_tracking_sources(self) -> None:
+        current = normalized_mini_source(self.settings, self.mini_source.currentData())
+        for index in range(self.mini_source.count()):
+            value = self.mini_source.itemData(index)
+            enabled = normalized_mini_source(self.settings, value) == value
+            self.mini_source.model().item(index).setEnabled(enabled)
+            self.mini_source.setItemData(index, "" if enabled else "請先在連線與使用引導啟用此來源", Qt.ItemDataRole.ToolTipRole)
+        self.mini_source.setCurrentIndex(self.mini_source.findData(current))
+
     def save(self) -> None:
         self.settings.setValue(SHOW_TOKEN_SETTING, self.show_tokens.isChecked())
         self.settings.setValue(UI_SCALE_SETTING, self.ui_scale.currentData())
@@ -1328,7 +1408,7 @@ class SettingsDialog(QDialog):
         self.settings.setValue("notify_every_five", self.notify_every_five.isChecked())
         self.settings.setValue("notify_low", self.notify_low.isChecked())
         self.settings.setValue("bubble_duration", self.bubble_duration.currentData())
-        self.settings.setValue("mini_source", self.mini_source.currentData())
+        self.settings.setValue("mini_source", normalized_mini_source(self.settings, self.mini_source.currentData()))
         self.settings.setValue(CODEX_RING_SETTING, self.codex_ring.currentData())
         self.settings.setValue("autostart", self.autostart.isChecked())
         self.settings.setValue(UPDATE_CHECK_SETTING, self.check_updates.isChecked())
@@ -1342,6 +1422,12 @@ class UsageWidget(QWidget):
     def __init__(self, screenshot_path: Path | None = None, demo: bool = False) -> None:
         super().__init__()
         self.settings = QSettings(str(APP_DIR / "preview.ini"), QSettings.Format.IniFormat) if demo or screenshot_path else QSettings("EricTools", "CodexUsageWidget")
+        # 既有使用者可從設定重開引導；升級時不自動打斷工作。
+        self._first_run = not self.settings.allKeys() and not (APP_DIR / "prompts.json").exists()
+        self._onboarding_dialog: OnboardingDialog | None = None
+        self._provider_states = {provider: ("unchecked", "") for provider in PROVIDERS}
+        self._active_providers: tuple[str, ...] = ()
+        self._pending_providers: set[str] = set()
         self.signals = FetchSignals()
         self.signals.succeeded.connect(self._on_fetch_success)
         self.signals.failed.connect(self._on_fetch_failure)
@@ -1385,6 +1471,7 @@ class UsageWidget(QWidget):
         self.paste_controller = PasteController(self)
 
         self._build_ui()
+        self._apply_provider_visibility()
         self._build_tray()
         self.alert_bubble = AlertBubble()
         self.mini = MiniUsageWidget(self)
@@ -1422,7 +1509,8 @@ class UsageWidget(QWidget):
                 ),
             )
         else:
-            QTimer.singleShot(100, self.refresh)
+            if not self._first_run or screenshot_path:
+                QTimer.singleShot(100, self.refresh)
             # 用量先抓，更新檢查慢一步，開機時不要跟它搶頻寬。
             QTimer.singleShot(5_000, self.check_for_update)
             self.update_timer = QTimer(self)
@@ -1431,6 +1519,8 @@ class UsageWidget(QWidget):
 
         if screenshot_path:
             QTimer.singleShot(9000 if not demo else 900, self._save_screenshot_and_quit)
+        elif not demo and self._first_run and not _setting_bool(self.settings, ONBOARDING_SEEN, False):
+            QTimer.singleShot(450, self.open_onboarding)
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
@@ -1486,6 +1576,12 @@ class UsageWidget(QWidget):
         root.addLayout(header)
         root.addWidget(self.surface_scroll, 1)
 
+        self.codex_card = QFrame()
+        self.codex_card.setObjectName("codexContainer")
+        self._codex_layout = QVBoxLayout(self.codex_card)
+        self._codex_layout.setContentsMargins(0, 0, 0, 0)
+        self._codex_layout.setSpacing(8)
+        quota.addWidget(self.codex_card)
         meta = QHBoxLayout()
         meta.setContentsMargins(0, 6, 0, 0)
         codex_name = QLabel("CODEX")
@@ -1502,11 +1598,11 @@ class UsageWidget(QWidget):
         self.sync_label.setMinimumWidth(80)
         self.sync_label.setMaximumWidth(130)
         meta.addWidget(self.sync_label)
-        quota.addLayout(meta)
+        self._codex_layout.addLayout(meta)
 
         self.codex_summary = QHBoxLayout()
         self.codex_summary.setSpacing(8)
-        quota.addLayout(self.codex_summary)
+        self._codex_layout.addLayout(self.codex_summary)
         self.ring_column = QVBoxLayout()
         self.ring_column.setSpacing(4)
         self.codex_summary.addLayout(self.ring_column)
@@ -1633,7 +1729,12 @@ class UsageWidget(QWidget):
         self.error_label.setObjectName("errorLabel")
         self.error_label.setWordWrap(True)
         self.error_label.hide()
-        quota.insertWidget(1, self.error_label)
+        quota.insertWidget(0, self.error_label)
+        self.codex_error_label = QLabel("")
+        self.codex_error_label.setObjectName("errorLabel")
+        self.codex_error_label.setWordWrap(True)
+        self.codex_error_label.hide()
+        self._codex_layout.insertWidget(1, self.codex_error_label)
         self._compact_layout = False
         self._adapt_layout()
         shell.installEventFilter(self)
@@ -1658,7 +1759,7 @@ class UsageWidget(QWidget):
                 codex_needed = max(
                     self.cycle_card.mapTo(quota_content, self.cycle_card.rect().bottomRight()).y(),
                     self.used_label.mapTo(quota_content, self.used_label.rect().bottomRight()).y(),
-                ) + 1
+                ) + 1 if not self.codex_card.isHidden() else self.claude_card.geometry().bottom() + 1
                 chrome = self.height() - self.surface_scroll.height() - self.prompt_panel.height()
                 prompt_height = min(self._prompt_height_target, max(96, self._height_limit - chrome - codex_needed))
                 if prompt_height != self.prompt_panel.height():
@@ -1666,7 +1767,8 @@ class UsageWidget(QWidget):
                     self._shell_layout.activate()
                     self._quota_layout.activate()
             # 以最後一張卡片的實際邊界量測，避免文字換行的預估高度留下空隙。
-            needed = self.claude_card.geometry().bottom() + 1
+            needed = max((card.geometry().bottom() + 1 for card in (self.codex_card, self.claude_card)
+                          if not card.isHidden()), default=0)
             surrounding = self.height() - self.surface_scroll.height()
             height = min(self._height_limit, surrounding + needed)
             if height != self.height():
@@ -1754,45 +1856,155 @@ class UsageWidget(QWidget):
         refresh_action.triggered.connect(lambda checked=False: self.refresh(audit=True))
         settings_action = QAction("設定", self)
         settings_action.triggered.connect(self.open_settings)
+        guide_action = QAction("連線與使用引導", self)
+        guide_action.triggered.connect(self.open_onboarding)
         quit_action = QAction("結束", self)
         quit_action.triggered.connect(self.quit_app)
         menu.addAction(show_action)
         menu.addAction(refresh_action)
         menu.addAction(settings_action)
+        menu.addAction(guide_action)
         menu.addSeparator()
         menu.addAction(quit_action)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
         self.tray.show()
 
-    def refresh(self, audit: bool = False) -> None:
+    def _tracked_providers(self) -> tuple[str, ...]:
+        selected = tuple(provider for provider in PROVIDERS
+                         if _setting_bool(self.settings, f"tracking/{provider}", True))
+        return selected or PROVIDERS
+
+    def _apply_provider_visibility(self) -> None:
+        selected = self._tracked_providers()
+        self.codex_card.setVisible("codex" in selected)
+        self.claude_card.setVisible("claude" in selected)
+
+    def open_onboarding(self, checked: bool = False, *, parent: QWidget | None = None) -> None:
+        if self._onboarding_dialog is not None:
+            self._onboarding_dialog.raise_()
+            self._onboarding_dialog.activateWindow()
+            return
+        if self.mini.isVisible():
+            self.expand_from_mini()
+        selected = self._tracked_providers()
+        source = "both" if len(selected) == 2 else selected[0]
+        dialog = OnboardingDialog(source, DIALOG_STYLE, parent or self)
+        self._onboarding_dialog = dialog
+        for provider, (status, detail) in self._provider_states.items():
+            dialog.set_provider_status(provider, status, detail)
+        dialog.refresh_requested.connect(self._check_onboarding_source)
+        dialog.provider_action_requested.connect(self._onboarding_action)
+        dialog.completed.connect(self._complete_onboarding)
+
+        def closed(result: int) -> None:
+            self.settings.setValue(ONBOARDING_SEEN, True)
+            self.settings.sync()
+            self._onboarding_dialog = None
+            dialog.deleteLater()
+            if isinstance(parent, SettingsDialog):
+                parent.sync_tracking_sources()
+            if result == QDialog.DialogCode.Rejected and self._first_run:
+                self.refresh()
+
+        dialog.finished.connect(closed)
+        dialog.open()
+
+    def _complete_onboarding(self, source: str) -> None:
+        selected = PROVIDERS if source == "both" else (source,)
+        if not selected or any(provider not in PROVIDERS for provider in selected):
+            return
+        for provider in PROVIDERS:
+            self.settings.setValue(f"tracking/{provider}", provider in selected)
+        mini_source = _setting_str(self.settings, "mini_source") or "min"
+        if mini_source in PROVIDERS and mini_source not in selected:
+            self.settings.setValue("mini_source", selected[0])
+        self.settings.setValue(ONBOARDING_SEEN, True)
+        self.settings.sync()
+        self._pending_providers.intersection_update(selected)
+        self._reapply_view()
+        self.tray.setToolTip(self._tray_tooltip())
+        self.refresh()
+
+    def _check_onboarding_source(self, source: str) -> None:
+        selected = PROVIDERS if source == "both" else (source,)
+        if all(provider in PROVIDERS for provider in selected):
+            self.refresh(providers=selected)
+
+    def _set_provider_status(self, provider: str, status: str, detail: str = "") -> None:
+        self._provider_states[provider] = (status, detail)
+        if self._onboarding_dialog is not None:
+            self._onboarding_dialog.set_provider_status(provider, status, detail)
+
+    def _set_provider_error(self, provider: str, message: str) -> None:
+        lowered = message.lower()
+        if any(text in lowered for text in ("尚未登入", "未登入", "not logged", "unauthorized")):
+            status = "not_logged_in"
+        elif any(text in message for text in ("找不到", "未安裝", "未偵測到")):
+            status = "not_installed"
+        else:
+            status = "temporary_failure"
+        self._set_provider_status(provider, status, message)
+
+    def _onboarding_action(self, provider: str, action: str) -> None:
+        if provider == "codex" and action in {"install", "login"}:
+            url = "https://developers.openai.com/codex/auth/" if action == "login" else "https://developers.openai.com/codex/app/"
+            if not QDesktopServices.openUrl(QUrl(url)):
+                status, _ = self._provider_states[provider]
+                self._set_provider_status(provider, status, "無法開啟瀏覽器，請開啟 Codex 完成安裝或登入後重新檢查。")
+        elif provider == "claude":
+            if action == "locate":
+                self._pick_claude_cli()
+            elif action == "login":
+                self._start_claude_login()
+
+    def refresh(self, audit: bool = False, *, providers: tuple[str, ...] | None = None) -> None:
+        if self._force_quit:
+            return
         if getattr(self, "token_service", None) is not None:
             self.token_service.refresh(audit=audit)
-        if self._fetching or self._demo:
+        if self._demo:
+            return
+        if providers is None and self._first_run and not _setting_bool(self.settings, ONBOARDING_SEEN, False):
+            return
+        selected = tuple(provider for provider in (providers or self._tracked_providers()) if provider in PROVIDERS)
+        if self._claude_logging_in:
+            selected = tuple(provider for provider in selected if provider != "claude")
+        if not selected:
+            return
+        if self._fetching:
+            # 切換追蹤來源或明確重新檢查時，等目前請求結束再補查。
+            if providers is not None or selected != self._active_providers:
+                self._pending_providers.update(selected)
             return
         self._fetching = True
+        self._active_providers = selected
         self.refresh_button.setEnabled(False)
         self.refresh_button.setText("更新中…")
-        self.sync_label.setText("正在同步")
+        if "codex" in selected:
+            self.sync_label.setText("正在同步")
+        for provider in selected:
+            self._set_provider_status(provider, "checking")
 
         def task() -> None:
-            result: dict[str, Any] = {}
-            try:
-                result["codex"] = CodexUsageClient().fetch()
-            except Exception as exc:
-                result["codex_error"] = str(exc)
-            try:
-                result["claude"] = ClaudeUsageClient().fetch()
-            except subprocess.TimeoutExpired:
-                result["claude_error"] = "Claude Code 回應逾時，下次自動更新會再試一次。"
-            except Exception as exc:
-                # 讀取失敗不等於未安裝：不在這裡偽造 unavailable 快照，
-                # 也不再呼叫 locate()——它若出錯會讓執行緒死在 except 裡，
-                # succeeded 訊號發不出去，整個面板就永遠凍結。
-                result["claude_error"] = str(exc)
+            result: dict[str, Any] = {"providers": selected}
+            for provider in selected:
+                try:
+                    client = CodexUsageClient() if provider == "codex" else ClaudeUsageClient()
+                    result[provider] = client.fetch()
+                except subprocess.TimeoutExpired:
+                    result[f"{provider}_error"] = f"{'Codex' if provider == 'codex' else 'Claude Code'} 回應逾時，下次自動更新會再試一次。"
+                except Exception as exc:
+                    result[f"{provider}_error"] = str(exc)
             self.signals.succeeded.emit(result)
 
         threading.Thread(target=task, daemon=True).start()
+
+    def _refresh_pending(self) -> None:
+        pending, self._pending_providers = tuple(provider for provider in PROVIDERS
+                                                if provider in self._pending_providers), set()
+        if pending:
+            QTimer.singleShot(0, lambda: self.refresh(providers=pending))
 
     def _show_error(self, message: str) -> None:
         self.error_label.setText(message)
@@ -1912,29 +2124,29 @@ class UsageWidget(QWidget):
         if not chosen:
             return
         self.settings.setValue(CLAUDE_CLI_SETTING, chosen)
-        self.refresh()
+        self.refresh(providers=("claude",))
 
     def _start_claude_login(self) -> None:
         if self._claude_logging_in or self._demo:
             return
-        cli = ClaudeCliLocator.locate()
-        if cli is None:
-            self._show_error("找不到 Claude Code 執行檔，請先安裝或手動指定路徑。")
-            return
-
         self._claude_logging_in = True
+        self._set_provider_status("claude", "checking", "請在開啟的登入視窗完成操作。")
         self.claude_login_button.setEnabled(False)
         self.claude_login_button.setText("登入中…請在開啟的視窗完成")
 
         def task() -> None:
             message = ""
             try:
+                cli = ClaudeCliLocator.locate()
+                if cli is None:
+                    raise RuntimeError("找不到 Claude Code 執行檔，請先安裝或手動指定路徑。")
                 # 授權流程需要使用者互動，開一個獨立主控台讓他們看得到並操作。
                 process = subprocess.Popen(
                     ClaudeCliLocator.command(cli, ["auth", "login"]),
                     creationflags=CREATE_NEW_CONSOLE,
                 )
-                process.wait()
+                if process.wait() != 0:
+                    raise RuntimeError("Claude Code 登入未完成或已取消，請再試一次。")
             except Exception as exc:
                 message = str(exc)
             self.signals.login_finished.emit(message)
@@ -1946,60 +2158,78 @@ class UsageWidget(QWidget):
         self.claude_login_button.setEnabled(True)
         self.claude_login_button.setText("登入 Claude Code")
         if message:
+            self._set_provider_error("claude", message)
             self._show_error(f"Claude Code 登入失敗：{message}")
             return
-        self.refresh()
+        self.refresh(providers=("claude",))
 
     def _on_fetch_success(self, result: dict[str, Any]) -> None:
         codex = result.get("codex")
         claude = result.get("claude")
+        requested = result.get("providers", PROVIDERS)
+        if self._claude_logging_in:
+            claude = None
+            requested = tuple(provider for provider in requested if provider != "claude")
         previous: UsageSnapshot | None = None
         previous_claude: ClaudeUsageSnapshot | None = None
         self._fetching = False
         self.refresh_button.setEnabled(True)
         self.refresh_button.setText("立即更新")
-        self.error_label.hide()
+        if "codex" in requested:
+            self.codex_error_label.hide()
 
         if isinstance(codex, UsageSnapshot):
             self._codex_sync_failed = False
+            detail = "" if any(codex_windows(codex)) else "已連線，但目前未提供訂閱額度；仍可使用常用指令。"
+            self._set_provider_status("codex", "available", detail)
             previous = self._load_previous_snapshot()
             self._snapshot = codex
             self._render_codex(codex)
             self._save_snapshot(codex)
-        else:
+        elif "codex" in requested:
             self._codex_sync_failed = True
             message = str(result.get("codex_error") or "Codex 用量暫時無法讀取。")
+            self._set_provider_error("codex", message)
             self._set_codex_error_badge(message)
             last = datetime.fromtimestamp(self._snapshot.fetched_at, TAIWAN_TZ).strftime("%m/%d %H:%M") if self._snapshot else ""
             self.sync_label.setText(f"同步失敗\n上次 {last}" if last else "同步失敗")
-            self.error_label.setText(message)
-            self.error_label.show()
+            self.codex_error_label.setText(message)
+            self.codex_error_label.show()
 
         if isinstance(claude, ClaudeUsageSnapshot):
             self._claude_sync_failed = False
+            if not claude.installed:
+                self._set_provider_status("claude", "not_installed")
+            elif not claude.logged_in:
+                self._set_provider_status("claude", "not_logged_in")
+            else:
+                detail = "" if claude.rate_limits_available else "已連線，但目前未提供訂閱額度。API 計費帳號沒有訂閱額度百分比。"
+                self._set_provider_status("claude", "available", detail)
             previous_claude = self._load_previous_claude_snapshot()
             self._claude_snapshot = claude
             self._render_claude(claude, str(result.get("claude_error") or ""))
             if claude.rate_limits_available:
                 self._save_claude_snapshot(claude)
-        else:
+        elif "claude" in requested:
             self._claude_sync_failed = True
-            self._render_claude_error(
-                str(result.get("claude_error") or "Claude Code 用量暫時無法讀取。")
-            )
+            message = str(result.get("claude_error") or "Claude Code 用量暫時無法讀取。")
+            self._set_provider_error("claude", message)
+            self._render_claude_error(message)
 
         self._update_mini_usage()
-        if isinstance(codex, UsageSnapshot):
+        if isinstance(codex, UsageSnapshot) and "codex" in self._tracked_providers():
             self._handle_notifications(previous, codex)
-        if isinstance(claude, ClaudeUsageSnapshot):
+        if isinstance(claude, ClaudeUsageSnapshot) and "claude" in self._tracked_providers():
             self._handle_claude_notifications(previous_claude, claude)
         self.tray.setToolTip(self._tray_tooltip())
+        self._refresh_pending()
 
     def _codex_ring_choice(self) -> str:
         return _setting_str(self.settings, CODEX_RING_SETTING) or "auto"
 
     def _reapply_view(self) -> None:
         """設定存檔後立刻套用，不用等下一次自動更新。"""
+        self._apply_provider_visibility()
         self.token_panel.setVisible(_setting_bool(self.settings, SHOW_TOKEN_SETTING, True))
         self._adapt_layout()
         self._content_fit_timer.start(0)
@@ -2008,12 +2238,32 @@ class UsageWidget(QWidget):
         self._update_mini_usage()
 
     def _update_mini_usage(self) -> None:
-        source = _setting_str(self.settings, "mini_source") or "min"
-        display = mini_usage_display(source, self._snapshot, self._claude_snapshot)
+        source = normalized_mini_source(self.settings, _setting_str(self.settings, "mini_source") or "min")
+        selected = self._tracked_providers()
+        codex = self._snapshot if "codex" in selected else None
+        claude = self._claude_snapshot if "claude" in selected else None
+        display = mini_usage_display(source, codex, claude)
         stale = bool(display and (
             self._codex_sync_failed if display.provider == "Codex" else self._claude_sync_failed
         ))
         self.mini.set_usage(display, source, stale)
+        rows = []
+        labels = {"unchecked": "尚未檢查", "checking": "正在檢查", "available": "尚無額度資料",
+                  "not_installed": "未安裝", "not_logged_in": "未登入", "temporary_failure": "暫時無法連線"}
+        for provider in selected:
+            snapshot = codex if provider == "codex" else claude
+            windows = codex_windows(codex) if provider == "codex" else (
+                (claude.five_hour, claude.seven_day) if claude is not None else (None, None))
+            failed = self._codex_sync_failed if provider == "codex" else self._claude_sync_failed
+            status = labels[self._provider_states[provider][0]]
+            for label, window in zip(("5 小時", "7 天"), windows):
+                rows.append(QuotaSummaryRow(
+                    "Codex" if provider == "codex" else "Claude Code", label,
+                    window.remaining_percent if window is not None else None,
+                    window.resets_at if window is not None else None,
+                    snapshot.fetched_at if snapshot is not None else None, failed,
+                    "" if window is not None else status))
+        self.mini.summary.set_rows(rows)
 
     def _render_codex(self, snapshot: UsageSnapshot) -> None:
         self.plan_badge.setStyleSheet("")
@@ -2150,14 +2400,17 @@ class UsageWidget(QWidget):
         self._set_codex_error_badge(friendly)
         self.error_label.setText(friendly)
         self.error_label.show()
+        for provider in self._active_providers or self._tracked_providers():
+            self._set_provider_error(provider, friendly)
         self._update_mini_usage()
+        self._refresh_pending()
 
     def _set_codex_error_badge(self, message: str) -> None:
         if self._snapshot is not None:
             return
-        if "登入" in message or "logged in" in message.lower():
+        if any(word in message.lower() for word in ("尚未登入", "未登入", "not logged", "unauthorized")):
             label = "未登入"
-        elif "找不到" in message or "未安裝" in message:
+        elif any(word in message for word in ("找不到", "未安裝", "未偵測到")):
             label = "未找到"
         else:
             label = "更新失敗"
@@ -2293,9 +2546,10 @@ class UsageWidget(QWidget):
 
     def _tray_tooltip(self) -> str:
         parts: list[str] = []
-        if self._snapshot and self._snapshot.primary:
+        selected = self._tracked_providers()
+        if "codex" in selected and self._snapshot and self._snapshot.primary:
             parts.append(f"Codex {percent_text(self._snapshot.primary.remaining_percent)}")
-        if self._claude_snapshot and self._claude_snapshot.five_hour:
+        if "claude" in selected and self._claude_snapshot and self._claude_snapshot.five_hour:
             parts.append(
                 f"Claude 5h {percent_text(self._claude_snapshot.five_hour.remaining_percent)}"
             )
@@ -2327,6 +2581,7 @@ class UsageWidget(QWidget):
             self.expand_from_mini()
         previous_scale = ui_scale_percent(self.settings)
         dialog = SettingsDialog(self.settings, self)
+        dialog.onboarding_requested.connect(lambda: self.open_onboarding(parent=dialog))
         dialog.settings_changed.connect(self._apply_timer_setting)
         dialog.settings_changed.connect(self._reapply_view)
         if dialog.exec() == QDialog.DialogCode.Accepted and ui_scale_percent(self.settings) != previous_scale:
@@ -2386,6 +2641,8 @@ class UsageWidget(QWidget):
 
     def quit_app(self) -> None:
         self._force_quit = True
+        if self._onboarding_dialog is not None:
+            self._onboarding_dialog.reject()
         self.paste_controller.target.close()
         self.alert_bubble.close()
         self.mini.close()
@@ -2523,6 +2780,14 @@ def _setting_bool(settings: QSettings, key: str, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).lower() in {"1", "true", "yes"}
+
+
+def normalized_mini_source(settings: QSettings, source: str) -> str:
+    selected = tuple(provider for provider in ("codex", "claude")
+                     if _setting_bool(settings, f"tracking/{provider}", True)) or ("codex", "claude")
+    if source in selected or source == "min":
+        return source
+    return selected[0] if len(selected) == 1 else "min"
 
 
 def ui_scale_percent(settings: QSettings) -> int:

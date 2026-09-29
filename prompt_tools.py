@@ -11,11 +11,11 @@ from pathlib import Path
 from typing import Callable
 from odometer import OdometerButton
 
-from PySide6.QtCore import QObject, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QListWidget, QMessageBox, QPlainTextEdit, QPushButton,
+    QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
     QScrollArea, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
     QToolTip, QVBoxLayout, QWidget,
 )
@@ -318,11 +318,137 @@ class PromptEditor(QDialog):
         self.accept()
 
 
+class PromptPicker(QDialog):
+    """搜尋並預覽指令；只有按下確認按鈕才會交回貼上的內容。"""
+
+    def __init__(self, prompts: list[Prompt], style: str, parent=None) -> None:
+        super().__init__(parent)
+        self.prompts = list(prompts)
+        self._by_id = {prompt.id: prompt for prompt in prompts}
+        self.chosen: Prompt | None = None
+        self.setWindowTitle("選擇常用指令")
+        self.setStyleSheet(style + PICKER_STYLE)
+        area = (parent.screen() if parent else QApplication.primaryScreen()).availableGeometry()
+        self.resize(min(760, area.width() - 32), min(510, area.height() - 32))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 18)
+        root.setSpacing(12)
+        title = QLabel("選擇常用指令")
+        title.setObjectName("dialogTitle")
+        root.addWidget(title)
+        hint = QLabel("先搜尋、選取並確認全文；不會自動送出給 AI 工具。")
+        hint.setObjectName("pickerHint")
+        root.addWidget(hint)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜尋指令名稱或內容")
+        self.search.setAccessibleName("搜尋指令名稱或內容")
+        self.search.installEventFilter(self)
+        self.search.textChanged.connect(self._filter)
+        root.addWidget(self.search)
+
+        columns = QHBoxLayout()
+        columns.setSpacing(14)
+        root.addLayout(columns, 1)
+        left = QVBoxLayout()
+        columns.addLayout(left, 1)
+        self.status = QLabel()
+        self.status.setObjectName("pickerHint")
+        self.status.setAccessibleName("搜尋結果數量")
+        left.addWidget(self.status)
+        self.results = QListWidget()
+        self.results.setAccessibleName("符合搜尋的指令")
+        self.results.setItemDelegate(PromptRowDelegate(self.results))
+        self.results.setMouseTracking(True)
+        self.results.installEventFilter(self)
+        self.results.currentItemChanged.connect(self._select)
+        left.addWidget(self.results, 1)
+
+        right = QVBoxLayout()
+        columns.addLayout(right, 2)
+        self.preview_title = QLabel("指令全文預覽")
+        self.preview_title.setObjectName("pickerPreviewTitle")
+        right.addWidget(self.preview_title)
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setAccessibleName("所選指令的完整內容預覽")
+        self.preview.installEventFilter(self)
+        right.addWidget(self.preview, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        root.addLayout(actions)
+        cancel = QPushButton("取消")
+        cancel.setObjectName("secondaryButton")
+        cancel.setAutoDefault(False)
+        cancel.clicked.connect(self.reject)
+        actions.addWidget(cancel)
+        self.confirm = QPushButton("貼上所選指令")
+        self.confirm.setAutoDefault(False)
+        self.confirm.clicked.connect(self._confirm)
+        actions.addWidget(self.confirm)
+        self._filter("")
+        self.search.setFocus()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape and watched in (self.search, self.results, self.preview):
+                self.reject()
+                return True
+            if watched is self.search and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                step = -1 if event.key() == Qt.Key.Key_Up else 1
+                if self.results.count():
+                    self.results.setCurrentRow(max(0, min(self.results.count() - 1,
+                                                        self.results.currentRow() + step)))
+                return True
+            if watched in (self.search, self.results, self.preview) and event.key() in (
+                    Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if self.confirm.isEnabled():
+                    self.confirm.setFocus()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _filter(self, query: str) -> None:
+        selected = self.results.currentItem()
+        selected_id = selected.data(Qt.ItemDataRole.UserRole) if selected else None
+        terms = query.casefold().split()
+        matches = [prompt for prompt in self.prompts
+                   if all(term in (prompt.title + "\n" + prompt.body).casefold() for term in terms)]
+        self.results.blockSignals(True)
+        self.results.clear()
+        for prompt in matches:
+            item = QListWidgetItem(prompt.title)
+            item.setData(Qt.ItemDataRole.UserRole, prompt.id)
+            item.setToolTip(prompt.title)
+            self.results.addItem(item)
+        ids = [prompt.id for prompt in matches]
+        if matches:
+            self.results.setCurrentRow(ids.index(selected_id) if selected_id in ids else 0)
+        self.results.blockSignals(False)
+        self.status.setText(f"找到 {len(matches)} 筆指令" if matches else "找不到符合的指令")
+        self._select(self.results.currentItem())
+
+    def _select(self, item: QListWidgetItem | None, previous=None) -> None:
+        prompt = self._by_id.get(item.data(Qt.ItemDataRole.UserRole)) if item else None
+        self.preview_title.setText(prompt.title if prompt else "指令全文預覽")
+        self.preview.setPlainText(prompt.body if prompt else "")
+        self.confirm.setEnabled(prompt is not None)
+
+    def _confirm(self) -> None:
+        item = self.results.currentItem()
+        if item is None:
+            return
+        self.chosen = self._by_id.get(item.data(Qt.ItemDataRole.UserRole))
+        if self.chosen is not None:
+            self.accept()
+
+
 class PromptPanel(QFrame):
     def __init__(self, store: PromptStore, controller: PasteController, dialog_style: str, parent=None) -> None:
         super().__init__(parent)
         self.store, self.controller, self.dialog_style = store, controller, dialog_style
-        self.prompts = store.load(); self.show_all = False
+        self.prompts = store.load()
         self.setObjectName("infoCard")
         layout = QVBoxLayout(self); layout.setContentsMargins(12, 12, 12, 10); layout.setSpacing(8)
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.Shape.NoFrame); self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -351,7 +477,7 @@ class PromptPanel(QFrame):
         while self.grid.count():
             item = self.grid.takeAt(0)
             if item.widget(): item.widget().deleteLater()
-        rows = self.prompts if self.show_all else self.prompts[:8]
+        rows = self.prompts[:8]
         for i, prompt in enumerate(rows):
             button = QPushButton(prompt.title); button.setObjectName("promptButton"); button.setMinimumWidth(0); button.setAccessibleName(prompt.title)
             button.setToolTip(prompt.title + "\n\n" + prompt.body)
@@ -359,7 +485,7 @@ class PromptPanel(QFrame):
             self.grid.addWidget(button, i // 2, i % 2)
         if not rows:
             button = QPushButton("新增第一個指令"); button.setObjectName("promptButton"); button.clicked.connect(self.edit); self.grid.addWidget(button, 0, 0, 1, 2)
-        self.more.setText("收起更多" if self.show_all else f"更多指令（{len(self.prompts)}）")
+        self.more.setText(f"更多指令（{len(self.prompts) - 8}）")
         self.more.setVisible(len(self.prompts) > 8)
         QTimer.singleShot(0, self.elide)
 
@@ -367,13 +493,18 @@ class PromptPanel(QFrame):
         super().resizeEvent(event); self.elide()
 
     def elide(self) -> None:
-        rows = self.prompts if self.show_all else self.prompts[:8]
+        rows = self.prompts[:8]
         for i, prompt in enumerate(rows):
             button = self.grid.itemAt(i).widget()
             button.setText(button.fontMetrics().elidedText(prompt.title, Qt.TextElideMode.ElideRight, max(10, button.width() - 20)))
 
     def toggle(self) -> None:
-        self.show_all = not self.show_all; self.rebuild()
+        picker = PromptPicker(self.prompts, self.dialog_style, self)
+        if picker.exec() == QDialog.DialogCode.Accepted and picker.chosen is not None:
+            self.controller.paste(picker.chosen.body)
+        else:
+            self.window().activateWindow()
+            self.more.setFocus()
 
     def edit(self) -> None:
         dialog = PromptEditor(self.prompts, self.dialog_style, self, save_callback=self.store.save)
@@ -386,5 +517,15 @@ EDITOR_STYLE = """
 QLineEdit, QPlainTextEdit, QListWidget { background: #111C2E; color: #F8FAFC; border: 1px solid #334155; border-radius: 9px; padding: 9px; font-size: 14px; }
 QLineEdit:focus, QPlainTextEdit:focus { border: 1px solid #35E28A; }
 QListWidget { padding: 6px; }
+QPushButton:focus { border: 2px solid #F8FAFC; }
+"""
+
+
+PICKER_STYLE = """
+QLineEdit, QPlainTextEdit, QListWidget { background: #111C2E; color: #F8FAFC; border: 1px solid #334155; border-radius: 9px; padding: 9px; font-size: 14px; }
+QLineEdit:focus, QPlainTextEdit:focus, QListWidget:focus { border: 2px solid #35E28A; }
+QListWidget { padding: 6px; }
+#pickerHint { color: #94A3B8; font-size: 12px; }
+#pickerPreviewTitle { color: #F8FAFC; font-size: 14px; font-weight: 700; }
 QPushButton:focus { border: 2px solid #F8FAFC; }
 """
