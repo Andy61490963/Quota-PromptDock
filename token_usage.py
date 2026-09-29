@@ -26,6 +26,7 @@ COUNTERS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
 MAX_LINE_BYTES = 8 * 1024 * 1024
 BATCH_LINES = 256
 MAX_COUNTER = 10**15
+HASH_CHUNK_BYTES = 1024 * 1024
 
 
 def codex_home() -> Path:
@@ -190,6 +191,9 @@ class TokenUsageStore:
                 (model and old["model"] and model != old["model"]) or
                 (effort and old["effort"] and effort != old["effort"]))
             model, effort = old["model"] or model, old["effort"] or effort
+            if (old["thread_id"], old["model"], old["effort"], old["ambiguous"]) == (
+                    thread, model, effort, int(ambiguous)):
+                return
         db.execute("INSERT OR REPLACE INTO contexts VALUES (?,?,?,?,?)",
                    (thread, turn, model, effort, int(ambiguous)))
 
@@ -205,7 +209,8 @@ class TokenUsageStore:
         timestamp = _timestamp(stamp)
         old = db.execute("SELECT * FROM responses WHERE response_id=?", (response_id,)).fetchone()
         if old:
-            if tuple(old[k] for k in COUNTERS) != values or old["thread_id"] != thread or old["turn_id"] != turn:
+            if not old["conflict"] and (tuple(old[k] for k in COUNTERS) != values or
+                                        old["thread_id"] != thread or old["turn_id"] != turn):
                 db.execute("UPDATE responses SET conflict=1 WHERE response_id=?", (response_id,))
             return
         db.execute("INSERT INTO responses VALUES (?,?,?,?,?,?,?,?,?,?,0)",
@@ -274,6 +279,7 @@ class ScanProgress:
     completed: int
     files: int
     bytes_read: int
+    changed: bool = False
 
 
 class TokenUsageCollector:
@@ -281,7 +287,7 @@ class TokenUsageCollector:
         self.store = store
         self.root = Path(root) if root is not None else codex_home()
 
-    def scan(self, discover=True, stop: threading.Event | None = None) -> Iterator[ScanProgress]:
+    def scan(self, discover=True, stop: threading.Event | None = None, *, audit=False) -> Iterator[ScanProgress]:
         stop = stop or threading.Event()
         with self.store.connection() as db:
             paths = {Path(row[0]) for row in db.execute("SELECT path FROM sources")}
@@ -301,54 +307,102 @@ class TokenUsageCollector:
                 if stop.is_set():
                     return
                 try:
-                    for consumed in self._read(db, path, stop):
+                    for consumed, changed in self._read(db, path, stop, audit=audit):
                         bytes_read += consumed
-                        yield ScanProgress(index, len(ordered), bytes_read)
+                        yield ScanProgress(index, len(ordered), bytes_read, changed)
                 except FileNotFoundError:
                     # Archiving/deletion does not erase previously imported usage.
+                    previous = db.execute("SELECT error FROM sources WHERE path=?", (str(path),)).fetchone()
                     with db:
                         db.execute("UPDATE sources SET error='' WHERE path=?", (str(path),))
+                    changed = bool(previous and previous["error"])
                 except OSError:
+                    previous = db.execute("SELECT error FROM sources WHERE path=?", (str(path),)).fetchone()
                     with db:
                         db.execute("INSERT OR IGNORE INTO sources(path) VALUES (?)", (str(path),))
                         db.execute("UPDATE sources SET error='read' WHERE path=?", (str(path),))
-                yield ScanProgress(index + 1, len(ordered), bytes_read)
+                    changed = previous is None or previous["error"] != "read"
+                else:
+                    changed = False
+                yield ScanProgress(index + 1, len(ordered), bytes_read, changed)
             if not ordered:
                 yield ScanProgress(0, 0, 0)
 
-    def _read(self, db, path: Path, stop: threading.Event):
+    @staticmethod
+    def _chunk_hashes(stream, size: int, first_chunk=0) -> list[str]:
+        hashes = []
+        stream.seek(first_chunk * HASH_CHUNK_BYTES)
+        remaining = size - first_chunk * HASH_CHUNK_BYTES
+        while remaining > 0:
+            length = min(HASH_CHUNK_BYTES, remaining)
+            chunk = stream.read(length)
+            if len(chunk) != length:
+                raise OSError("來源檔案在雜湊巡檢時變動")
+            hashes.append(hashlib.sha256(chunk).hexdigest())
+            remaining -= length
+        return hashes
+
+    def _read(self, db, path: Path, stop: threading.Event, *, audit=False):
         stat = path.stat()
         identity = f"{stat.st_dev}:{stat.st_ino}"
         old = db.execute("SELECT * FROM sources WHERE path=?", (str(path),)).fetchone()
+        # 未變動的來源不需每十秒重新開檔及計算雜湊；未完成行會在檔案增長時接續處理。
+        if (not audit and old and not old["error"] and old["identity"] == identity and
+                old["size"] == stat.st_size and old["mtime"] == stat.st_mtime_ns and
+                (old["offset"] == old["size"] or json.loads(old["state"]).get("pending_partial"))):
+            return
         with open_shared(path) as stream:
+            old_state = json.loads(old["state"]) if old else {}
+            old_chunks = old_state.get("chunks") if isinstance(old_state.get("chunks"), list) else None
             prefix_len = old["prefix_len"] if old and old["prefix_len"] else min(1024, stat.st_size)
             prefix = hashlib.sha256(stream.read(prefix_len)).hexdigest()
             reset = not old or old["identity"] != identity or stat.st_size < old["offset"] or old["prefix"] != prefix
             if old and stat.st_size == old["offset"] and stat.st_mtime_ns != old["mtime"]:
                 reset = True
             if old and not reset:
-                checkpoint = json.loads(old["state"]).get("tail")
+                checkpoint = old_state.get("tail")
                 stream.seek(max(0, old["offset"] - 512))
                 if checkpoint and hashlib.sha256(stream.read(min(512, old["offset"]))).hexdigest() != checkpoint:
                     reset = True
+            # 每個區塊保留 SHA-256；追加時只重算末尾區塊，完整巡檢則重算全部。
+            unchanged = (old and old_chunks is not None and not audit and not reset and
+                         old["identity"] == identity and old["size"] == stat.st_size and
+                         old["mtime"] == stat.st_mtime_ns)
+            if unchanged:
+                chunks = old_chunks
+            else:
+                append = (old and old_chunks is not None and not audit and not reset and
+                          stat.st_size > old["size"] and old["identity"] == identity)
+                first_chunk = max(0, (old["size"] - 1) // HASH_CHUNK_BYTES) if append else 0
+                chunks = (old_chunks[:first_chunk] if append else []) + self._chunk_hashes(
+                    stream, stat.st_size, first_chunk)
+            if (audit and old_chunks is not None and old["size"] == stat.st_size and
+                    chunks != old_chunks):
+                reset = True
             if not reset and old["offset"] == stat.st_size and old["mtime"] == stat.st_mtime_ns:
-                if old["error"]:
+                if old["error"] or old_chunks is None:
+                    old_state["chunks"] = chunks
                     with db:
-                        db.execute("UPDATE sources SET error='' WHERE path=?", (str(path),))
+                        db.execute("UPDATE sources SET error='', state=? WHERE path=?",
+                                   (json.dumps(old_state, separators=(",", ":")), str(path)))
+                    yield 0, bool(old["error"])
                 return
             if reset:
                 stream.seek(0)
                 prefix_len = min(1024, stat.st_size)
                 prefix = hashlib.sha256(stream.read(prefix_len)).hexdigest()
             offset = 0 if reset else old["offset"]
-            state = {} if reset else json.loads(old["state"])
+            state = {} if reset else old_state
+            state["chunks"] = chunks
             bad = 0 if reset else old["bad_lines"]
             invalid = 0 if reset else old["invalid_usage"]
             stream.seek(offset)
             finished = False
             while not finished and not stop.is_set():
                 before = offset
+                pending_partial = False
                 with db:
+                    before_changes = db.total_changes
                     for _ in range(BATCH_LINES):
                         if stop.is_set() or stream.tell() >= stat.st_size:
                             finished = True
@@ -364,6 +418,7 @@ class TokenUsageCollector:
                                 break
                         if not raw.endswith(b"\n"):
                             # Leave the cursor at the start of an unfinished line.
+                            pending_partial = True
                             finished = True
                             break
                         offset = stream.tell()
@@ -381,16 +436,21 @@ class TokenUsageCollector:
                             self._record(db, record, state)
                         except (ValueError, TypeError, OverflowError):
                             invalid += 1
+                    data_changed = db.total_changes != before_changes
                     position = stream.tell()
                     stream.seek(max(0, offset - 512))
                     state["tail"] = hashlib.sha256(stream.read(min(512, offset))).hexdigest()
+                    state["pending_partial"] = pending_partial
                     stream.seek(position)
                     db.execute("""INSERT OR REPLACE INTO sources
                         (path,identity,offset,size,mtime,prefix,prefix_len,state,bad_lines,invalid_usage,error)
                         VALUES (?,?,?,?,?,?,?,?,?,?,'')""",
                         (str(path), identity, offset, stat.st_size, stat.st_mtime_ns, prefix, prefix_len,
                          json.dumps(state, separators=(",", ":")), bad, invalid))
-                yield offset - before
+                source_changed = (old is None or bool(old["error"]) or
+                                  bad != old["bad_lines"] or invalid != old["invalid_usage"])
+                yield offset - before, data_changed or source_changed
+                old = db.execute("SELECT * FROM sources WHERE path=?", (str(path),)).fetchone()
 
     def _record(self, db, record: dict, state: dict):
         kind, payload = record.get("type"), record.get("payload")

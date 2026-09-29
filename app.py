@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import deque
 import json
 import math
 import os
@@ -45,10 +46,13 @@ from PySide6.QtWidgets import (
 from prompt_tools import PasteController, PromptPanel, PromptStore
 from token_panel import SHOW_TOKEN_SETTING, TokenUsagePanel, TokenUsageService, demo_report
 from odometer import DigitRoller, OdometerLabel
+from updates import UpdateChecker, parse_release, GITHUB_REPO, RELEASE_API, RELEASE_DOWNLOAD_PREFIX, RELEASE_ASSET
+from windows_install import install_windows_release, signal_startup_ready, set_frozen_autostart as _set_frozen_autostart
+from install_handoff import handoff_environment, wait_for_handoff, schedule_download_cleanup, discard_download
 
 
 APP_NAME = "Quota PromptDock"
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.4.5"
 UI_SCALE_SETTING = "ui_scale_percent"
 UI_SCALE_CHOICES = (75, 90, 100, 110, 125, 150)
 TAIWAN_TZ = timezone(timedelta(hours=8))
@@ -86,62 +90,6 @@ def is_newer_version(latest: str, current: str) -> bool:
     return _version_key(latest.lstrip("vV")) > _version_key(current.lstrip("vV"))
 
 
-def parse_release(payload: dict[str, Any]) -> tuple[str, str] | None:
-    """從 GitHub release JSON 取出 (版本, 下載網址)。
-
-    草稿、預發行、或沒有 Windows 執行檔的 release 一律當作沒有新版；下載網址
-    也必須真的指向本專案的 release，免得回應被動過手腳就把使用者導去別的地方。
-    """
-    if payload.get("draft") or payload.get("prerelease"):
-        return None
-    tag = str(payload.get("tag_name") or "").strip()
-    if not tag:
-        return None
-    for asset in payload.get("assets") or []:
-        if str(asset.get("name") or "") != RELEASE_ASSET:
-            continue
-        url = str(asset.get("browser_download_url") or "")
-        if url.startswith(RELEASE_DOWNLOAD_PREFIX):
-            return tag.lstrip("vV"), url
-    return None
-
-
-class UpdateChecker:
-    """問 GitHub 有沒有新版，有的話把安裝檔抓下來。"""
-
-    def __init__(self, timeout_seconds: float = 10.0) -> None:
-        self.timeout_seconds = timeout_seconds
-
-    def _request(self, url: str) -> urllib.request.Request:
-        return urllib.request.Request(
-            url,
-            headers={
-                # GitHub API 不接受沒有 User-Agent 的請求。
-                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-                "Accept": "application/vnd.github+json",
-            },
-        )
-
-    def latest(self) -> tuple[str, str] | None:
-        with urllib.request.urlopen(self._request(RELEASE_API), timeout=self.timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        if not isinstance(payload, dict):
-            return None
-        return parse_release(payload)
-
-    def download(self, url: str, destination: Path) -> Path:
-        if not url.startswith(RELEASE_DOWNLOAD_PREFIX):
-            raise RuntimeError("下載網址不是本專案的 release，已中止。")
-        with urllib.request.urlopen(self._request(url), timeout=180) as response:
-            with destination.open("wb") as handle:
-                shutil.copyfileobj(response, handle)
-        # 半途斷線會留下一個能執行但壞掉的檔案，寧可擋下來。
-        if destination.stat().st_size < 5_000_000:
-            destination.unlink(missing_ok=True)
-            raise RuntimeError("下載的檔案不完整，請稍後再試。")
-        return destination
-
-
 def clamped_position(point: QPoint, size: QSize, area: QRect) -> QPoint:
     """把記住的座標夾回可見範圍。
 
@@ -157,10 +105,6 @@ def clamped_position(point: QPoint, size: QSize, area: QRect) -> QPoint:
     )
 
 
-GITHUB_REPO = "Andy61490963/Quota-PromptDock"
-RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-RELEASE_DOWNLOAD_PREFIX = f"https://github.com/{GITHUB_REPO}/releases/download/"
-RELEASE_ASSET = "QuotaDock-Windows-x64.exe"
 UPDATE_CHECK_SETTING = "check_updates"
 CODEX_RING_SETTING = "codex_ring"
 # Codex 把 5 小時與 7 天分別放在 primary/secondary，但哪個在前面會變，
@@ -361,36 +305,52 @@ def codex_ring_window(
     return min(available, key=lambda window: window.remaining_percent) if available else None
 
 
+@dataclass(frozen=True)
+class MiniUsageDisplay:
+    remaining_percent: float
+    provider: str
+    window: str
+    fetched_at: int
+
+
+def mini_usage_display(
+    source: str,
+    codex: UsageSnapshot | None,
+    claude: "ClaudeUsageSnapshot | None",
+) -> MiniUsageDisplay | None:
+    """保留實際來源，指定單一來源時不以另一服務的額度充數。"""
+
+    codex_values: list[MiniUsageDisplay] = []
+    if codex is not None:
+        codex_values = [
+            MiniUsageDisplay(window.remaining_percent, "Codex", label, codex.fetched_at)
+            for label, window in zip(("5 小時", "7 天"), codex_windows(codex))
+            if window is not None
+        ]
+    claude_values: list[MiniUsageDisplay] = []
+    if claude is not None:
+        claude_values = [
+            MiniUsageDisplay(window.remaining_percent, "Claude Code", label, claude.fetched_at)
+            for label, window in (("5 小時", claude.five_hour), ("7 天", claude.seven_day))
+            if window is not None
+        ]
+
+    if source == "codex":
+        values = codex_values
+    elif source == "claude":
+        values = claude_values
+    else:
+        values = codex_values + claude_values
+    return min(values, key=lambda item: item.remaining_percent) if values else None
+
+
 def mini_remaining(
     source: str,
     codex: UsageSnapshot | None,
     claude: "ClaudeUsageSnapshot | None",
 ) -> float | None:
-    """懸浮圖示要顯示的剩餘百分比；指定來源沒資料時退回看得到的那邊。"""
-
-    def codex_values() -> list[float]:
-        return [
-            window.remaining_percent
-            for window in codex_windows(codex)
-            if window is not None
-        ]
-
-    def claude_values() -> list[float]:
-        if claude is None:
-            return []
-        return [
-            window.remaining_percent
-            for window in (claude.five_hour, claude.seven_day)
-            if window is not None
-        ]
-
-    if source == "codex":
-        values = codex_values() or claude_values()
-    elif source == "claude":
-        values = claude_values() or codex_values()
-    else:
-        values = codex_values() + claude_values()
-    return min(values) if values else None
+    display = mini_usage_display(source, codex, claude)
+    return display.remaining_percent if display else None
 
 
 def detect_window_reset(previous: UsageWindow | None, current: UsageWindow | None) -> bool:
@@ -906,9 +866,12 @@ class ClaudeUsageClient:
             creationflags=CREATE_NO_WINDOW,
         )
         try:
-            return json.loads(completed.stdout)
-        except json.JSONDecodeError:
-            return {"loggedIn": False, "authMethod": "unknown"}
+            auth = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Claude Code 登入狀態暫時無法讀取，稍後會自動重試。") from exc
+        if not isinstance(auth, dict) or not isinstance(auth.get("loggedIn"), bool):
+            raise RuntimeError("Claude Code 登入狀態格式不正確，稍後會自動重試。")
+        return auth
 
 
 class FetchSignals(QObject):
@@ -917,6 +880,7 @@ class FetchSignals(QObject):
     login_finished = Signal(str)
     update_available = Signal(str, str)
     update_ready = Signal(str)
+    update_handoff = Signal()
     update_failed = Signal(str)
 
 
@@ -969,6 +933,7 @@ class UsageRing(QWidget):
 class AlertBubble(QFrame):
     def __init__(self) -> None:
         super().__init__(None)
+        self._pending: deque[tuple[str, str, int, QRectF]] = deque()
         self.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
@@ -998,7 +963,7 @@ class AlertBubble(QFrame):
         close = QPushButton("×")
         close.setObjectName("bubbleClose")
         close.setAccessibleName("關閉提醒")
-        close.clicked.connect(self.hide)
+        close.clicked.connect(self._advance)
         header.addWidget(self.title_label)
         header.addStretch()
         header.addWidget(close)
@@ -1009,9 +974,22 @@ class AlertBubble(QFrame):
         layout.addWidget(self.message_label)
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
-        self.timer.timeout.connect(self.hide)
+        self.timer.timeout.connect(self._advance)
 
     def show_message(self, title: str, message: str, duration_ms: int, anchor: QRectF) -> None:
+        self._pending.append((title, message, duration_ms, QRectF(anchor)))
+        if not self.timer.isActive():
+            self._show_next()
+
+    def _advance(self) -> None:
+        self.timer.stop()
+        self.hide()
+        self._show_next()
+
+    def _show_next(self) -> None:
+        if not self._pending:
+            return
+        title, message, duration_ms, anchor = self._pending.popleft()
         self.title_label.setText(title)
         self.message_label.setText(message)
         anchor_center = QPoint(round(anchor.center().x()), round(anchor.center().y()))
@@ -1047,14 +1025,29 @@ class MiniUsageWidget(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(74, 74)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("點一下展開 AI 用量小工具")
+        self.setToolTip("點一下或按 Enter 展開 AI 用量小工具")
         self.setAccessibleName("AI 用量懸浮圖示")
+        self._provider = "無資料"
+        self._stale = False
         self.roller.set_text("—")
 
-    def set_remaining(self, value: float | None) -> None:
-        self._remaining = None if value is None else max(0.0, min(100.0, value))
-        self.setAccessibleDescription("尚無資料" if self._remaining is None else f"目前最低剩餘量 {percent_text(self._remaining)}")
+    def set_usage(self, display: MiniUsageDisplay | None, source: str, stale: bool = False) -> None:
+        self._remaining = None if display is None else max(0.0, min(100.0, display.remaining_percent))
+        self._provider = "無資料" if display is None else ("Codex" if display.provider == "Codex" else "Claude")
+        self._stale = bool(display is not None and stale)
+        if display is None:
+            chosen = {"codex": "Codex", "claude": "Claude Code"}.get(source, "Codex 與 Claude Code")
+            detail = f"{chosen} 目前沒有額度資料。"
+        else:
+            updated = datetime.fromtimestamp(display.fetched_at, TAIWAN_TZ).strftime("%Y/%m/%d %H:%M")
+            detail = (f"{display.provider} {display.window}額度剩餘 {percent_text(self._remaining)}；"
+                      f"上次成功更新：{updated}（台灣時間）。")
+            if stale:
+                detail += " 同步失敗，顯示上次成功資料。"
+        self.setToolTip(detail + " 點一下或按 Enter 展開小工具。")
+        self.setAccessibleDescription(detail)
         self.roller.set_text("—" if self._remaining is None else percent_text(self._remaining))
         self.update()
 
@@ -1070,7 +1063,7 @@ class MiniUsageWidget(QWidget):
     def paintEvent(self, event: Any) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor("#334155"), 1))
+        painter.setPen(QPen(QColor("#F8FAFC" if self.hasFocus() else "#334155"), 2 if self.hasFocus() else 1))
         painter.setBrush(QColor("#0B1220"))
         painter.drawEllipse(QRectF(3, 3, 68, 68))
         ring = QRectF(9, 9, 56, 56)
@@ -1080,7 +1073,17 @@ class MiniUsageWidget(QWidget):
         painter.drawArc(ring, 90 * 16, round(-360 * 16 * (self._remaining or 0) / 100))
         painter.setPen(QColor("#F8FAFC"))
         painter.setFont(ui_font(13, QFont.Weight.Bold))
-        self.roller.paint(painter, self.rect(), Qt.AlignmentFlag.AlignCenter)
+        self.roller.paint(painter, QRectF(5, 13, 64, 37), Qt.AlignmentFlag.AlignCenter)
+        painter.setPen(QColor("#CBD5E1"))
+        painter.setFont(ui_font(7, QFont.Weight.Medium))
+        painter.drawText(QRectF(9, 47, 56, 16), Qt.AlignmentFlag.AlignCenter, self._provider)
+        if self._stale:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#FBBF24"))
+            painter.drawEllipse(QRectF(56, 3, 14, 14))
+            painter.setPen(QColor("#17120B"))
+            painter.setFont(ui_font(8, QFont.Weight.Bold))
+            painter.drawText(QRectF(56, 2, 14, 15), Qt.AlignmentFlag.AlignCenter, "!")
 
     def show_docked(self) -> None:
         saved = self.owner.settings.value("mini_position")
@@ -1129,6 +1132,21 @@ class MiniUsageWidget(QWidget):
             self._start_position = None
             event.accept()
 
+    def keyPressEvent(self, event: Any) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.owner.expand_from_mini()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusInEvent(self, event: Any) -> None:
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event: Any) -> None:
+        super().focusOutEvent(event)
+        self.update()
+
     def contextMenuEvent(self, event: Any) -> None:
         menu = QMenu()
         show_action = menu.addAction("展開小工具")
@@ -1140,7 +1158,7 @@ class MiniUsageWidget(QWidget):
         if selected == show_action:
             self.owner.expand_from_mini()
         elif selected == refresh_action:
-            self.owner.refresh()
+            self.owner.refresh(audit=True)
         elif selected == settings_action:
             self.owner.open_settings()
         elif selected == quit_action:
@@ -1330,6 +1348,7 @@ class UsageWidget(QWidget):
         self.signals.login_finished.connect(self._on_claude_login_finished)
         self.signals.update_available.connect(self._on_update_available)
         self.signals.update_ready.connect(self._on_update_ready)
+        self.signals.update_handoff.connect(self.quit_app)
         self.signals.update_failed.connect(self._on_update_failed)
         self._fetching = False
         self._update_checking = False
@@ -1341,6 +1360,8 @@ class UsageWidget(QWidget):
         self._drag_offset: QPoint | None = None
         self._snapshot: UsageSnapshot | None = None
         self._claude_snapshot: ClaudeUsageSnapshot | None = None
+        self._codex_sync_failed = False
+        self._claude_sync_failed = False
         self._screenshot_path = screenshot_path
         self._demo = demo
         self._force_quit = False
@@ -1599,7 +1620,7 @@ class UsageWidget(QWidget):
         controls.setSpacing(10)
         self.refresh_button = QPushButton("立即更新")
         self.refresh_button.setAccessibleName("立即更新 Codex 與 Claude Code 用量")
-        self.refresh_button.clicked.connect(self.refresh)
+        self.refresh_button.clicked.connect(lambda checked=False: self.refresh(audit=True))
         settings_button = QPushButton("設定")
         settings_button.setObjectName("secondaryButton")
         settings_button.setAccessibleName("開啟小工具設定")
@@ -1730,7 +1751,7 @@ class UsageWidget(QWidget):
         show_action = QAction("顯示小工具", self)
         show_action.triggered.connect(self.show_and_raise)
         refresh_action = QAction("立即更新", self)
-        refresh_action.triggered.connect(self.refresh)
+        refresh_action.triggered.connect(lambda checked=False: self.refresh(audit=True))
         settings_action = QAction("設定", self)
         settings_action.triggered.connect(self.open_settings)
         quit_action = QAction("結束", self)
@@ -1744,9 +1765,9 @@ class UsageWidget(QWidget):
         self.tray.activated.connect(self._tray_activated)
         self.tray.show()
 
-    def refresh(self) -> None:
+    def refresh(self, audit: bool = False) -> None:
         if getattr(self, "token_service", None) is not None:
-            self.token_service.refresh()
+            self.token_service.refresh(audit=audit)
         if self._fetching or self._demo:
             return
         self._fetching = True
@@ -1791,7 +1812,7 @@ class UsageWidget(QWidget):
 
         def task() -> None:
             try:
-                found = UpdateChecker().latest()
+                found = UpdateChecker(version=APP_VERSION).latest()
             except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
                 found = None
             if found and is_newer_version(found[0], APP_VERSION):
@@ -1818,13 +1839,18 @@ class UsageWidget(QWidget):
         self.update_button.setEnabled(False)
         self.update_button.setText("下載中…")
         url = self._update_url
-        version = self._update_version
-
         def task() -> None:
-            target = Path(tempfile.gettempdir()) / f"QuotaDock-{version}.exe"
+            target = None
             try:
-                UpdateChecker().download(url, target)
+                target = Path(tempfile.mkdtemp(prefix="QuotaDock-update-")) / RELEASE_ASSET
+                UpdateChecker(version=APP_VERSION).download(url, target)
             except Exception as exc:
+                if target is not None:
+                    try:
+                        target.unlink(missing_ok=True)
+                        target.parent.rmdir()
+                    except OSError:
+                        pass
                 self.signals.update_failed.emit(str(exc))
                 return
             self.signals.update_ready.emit(str(target))
@@ -1832,17 +1858,41 @@ class UsageWidget(QWidget):
         threading.Thread(target=task, daemon=True).start()
 
     def _on_update_ready(self, installer: str) -> None:
-        self._update_downloading = False
+        self._update_downloading = True
         self.update_button.setText("安裝中…請稍候")
-        # 下載回來的就是完整安裝檔：它會關掉舊的、覆蓋安裝、再自己啟動。
-        subprocess.Popen([installer, "--install"], close_fds=True, creationflags=CREATE_NO_WINDOW)
-        self.quit_app()
+        # 安裝檔完成暫存與校驗後才交接，準備失敗時主視窗仍可使用。
+        handoff_path = None
+        try:
+            environment, handoff_path, token = handoff_environment(Path(installer))
+            process = subprocess.Popen([installer, "--install"], env=environment,
+                                       close_fds=True, creationflags=CREATE_NO_WINDOW)
+        except OSError:
+            if handoff_path is not None:
+                try:
+                    handoff_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            discard_download(Path(installer))
+            self._on_update_failed("無法啟動安裝程式，請稍後重試。")
+            return
+
+        def wait_for_installer() -> None:
+            try:
+                wait_for_handoff(process, handoff_path, token)
+            except Exception as exc:
+                if process.poll() is not None:
+                    discard_download(Path(installer))
+                self.signals.update_failed.emit(str(exc))
+                return
+            self.signals.update_handoff.emit()
+
+        threading.Thread(target=wait_for_installer, daemon=True).start()
 
     def _on_update_failed(self, message: str) -> None:
         self._update_downloading = False
         self.update_button.setEnabled(True)
         self.update_button.setText(f"更新失敗，點此重試 (v{self._update_version})")
-        self._show_error(f"下載新版失敗：{message}")
+        self._show_error(f"更新失敗：{message}")
 
     def _on_claude_button_clicked(self) -> None:
         if self._claude_action == "locate":
@@ -1911,25 +1961,29 @@ class UsageWidget(QWidget):
         self.error_label.hide()
 
         if isinstance(codex, UsageSnapshot):
+            self._codex_sync_failed = False
             previous = self._load_previous_snapshot()
             self._snapshot = codex
             self._render_codex(codex)
             self._save_snapshot(codex)
         else:
+            self._codex_sync_failed = True
             message = str(result.get("codex_error") or "Codex 用量暫時無法讀取。")
             self._set_codex_error_badge(message)
-            last = datetime.fromtimestamp(self._snapshot.fetched_at, TAIWAN_TZ).strftime("%H:%M") if self._snapshot else ""
+            last = datetime.fromtimestamp(self._snapshot.fetched_at, TAIWAN_TZ).strftime("%m/%d %H:%M") if self._snapshot else ""
             self.sync_label.setText(f"同步失敗\n上次 {last}" if last else "同步失敗")
             self.error_label.setText(message)
             self.error_label.show()
 
         if isinstance(claude, ClaudeUsageSnapshot):
+            self._claude_sync_failed = False
             previous_claude = self._load_previous_claude_snapshot()
             self._claude_snapshot = claude
             self._render_claude(claude, str(result.get("claude_error") or ""))
             if claude.rate_limits_available:
                 self._save_claude_snapshot(claude)
         else:
+            self._claude_sync_failed = True
             self._render_claude_error(
                 str(result.get("claude_error") or "Claude Code 用量暫時無法讀取。")
             )
@@ -1955,9 +2009,11 @@ class UsageWidget(QWidget):
 
     def _update_mini_usage(self) -> None:
         source = _setting_str(self.settings, "mini_source") or "min"
-        self.mini.set_remaining(
-            mini_remaining(source, self._snapshot, self._claude_snapshot)
-        )
+        display = mini_usage_display(source, self._snapshot, self._claude_snapshot)
+        stale = bool(display and (
+            self._codex_sync_failed if display.provider == "Codex" else self._claude_sync_failed
+        ))
+        self.mini.set_usage(display, source, stale)
 
     def _render_codex(self, snapshot: UsageSnapshot) -> None:
         self.plan_badge.setStyleSheet("")
@@ -2084,13 +2140,17 @@ class UsageWidget(QWidget):
 
     def _on_fetch_failure(self, message: str) -> None:
         self._fetching = False
+        self._codex_sync_failed = True
+        self._claude_sync_failed = True
         self.refresh_button.setEnabled(True)
         self.refresh_button.setText("重新連線")
-        self.sync_label.setText("同步失敗")
+        last = datetime.fromtimestamp(self._snapshot.fetched_at, TAIWAN_TZ).strftime("%m/%d %H:%M") if self._snapshot else ""
+        self.sync_label.setText(f"同步失敗\n上次 {last}" if last else "同步失敗")
         friendly = message.strip() or "暫時無法讀取用量，稍後會自動重試。"
         self._set_codex_error_badge(friendly)
         self.error_label.setText(friendly)
         self.error_label.show()
+        self._update_mini_usage()
 
     def _set_codex_error_badge(self, message: str) -> None:
         if self._snapshot is not None:
@@ -2492,26 +2552,6 @@ def restart_command() -> list[str]:
     return [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
 
 
-def _set_frozen_autostart(executable: Path, enabled: bool) -> None:
-    import winreg
-
-    run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
-        if enabled:
-            winreg.SetValueEx(
-                key, "QuotaDock", 0, winreg.REG_SZ, f'"{executable.resolve()}"'
-            )
-        else:
-            try:
-                winreg.DeleteValue(key, "QuotaDock")
-            except FileNotFoundError:
-                pass
-        try:
-            winreg.DeleteValue(key, "CodexUsageWidget")
-        except FileNotFoundError:
-            pass
-
-
 def configure_autostart(enabled: bool) -> None:
     if os.name != "nt":
         return
@@ -2541,57 +2581,18 @@ def configure_autostart(enabled: bool) -> None:
 
 
 def install_frozen_release() -> bool:
-    """Install a downloaded one-file release, launch the installed copy, then exit."""
+    """安裝到使用者目錄，失敗時保留可重新啟動的舊版。"""
     if os.name != "nt" or not getattr(sys, "frozen", False):
         return False
-
     current = Path(sys.executable).resolve()
-    install_dir = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "QuotaDock"
-    target = install_dir / "QuotaDock.exe"
+    target = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "QuotaDock" / "QuotaDock.exe"
     if str(current).casefold() == str(target.resolve()).casefold():
         return False
-
-    install_dir.mkdir(parents=True, exist_ok=True)
-    installer_env = os.environ.copy()
-    installer_env["QUOTADOCK_INSTALL_TARGET"] = str(target)
-    if target.exists():
-        stop_script = (
-            "$target = [IO.Path]::GetFullPath($env:QUOTADOCK_INSTALL_TARGET); "
-            "Get-CimInstance Win32_Process | "
-            "Where-Object { $_.ExecutablePath -eq $target } | "
-            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; "
-            "Start-Sleep -Milliseconds 500"
-        )
-        subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", stop_script],
-            check=False,
-            creationflags=CREATE_NO_WINDOW,
-            env=installer_env,
-        )
-
-    shutil.copy2(current, target)
-    shortcut_script = (
-        "$target = $env:QUOTADOCK_INSTALL_TARGET; $folder = Split-Path -Parent $target; "
-        "$path = Join-Path ([Environment]::GetFolderPath('Desktop')) 'QuotaDock.lnk'; "
-        "$shell = New-Object -ComObject WScript.Shell; "
-        "$shortcut = $shell.CreateShortcut($path); "
-        "$shortcut.TargetPath = $target; $shortcut.WorkingDirectory = $folder; "
-        "$shortcut.Description = 'AI 額度與常用指令小工具'; "
-        "$shortcut.IconLocation = \"$target,0\"; $shortcut.Save()"
-    )
-    subprocess.run(
-        ["powershell.exe", "-NoProfile", "-Command", shortcut_script],
-        check=True,
-        creationflags=CREATE_NO_WINDOW,
-        env=installer_env,
-    )
-    _set_frozen_autostart(target, _setting_bool(QSettings("EricTools", "CodexUsageWidget"), "autostart", False))
-    subprocess.Popen(
-        [str(target)],
-        cwd=str(install_dir),
-        close_fds=True,
-        creationflags=CREATE_NO_WINDOW,
-    )
+    autostart = _setting_bool(QSettings("EricTools", "CodexUsageWidget"), "autostart", False)
+    try:
+        install_windows_release(current, target, autostart)
+    finally:
+        schedule_download_cleanup(current)
     return True
 
 
@@ -2738,8 +2739,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.install and not args.demo and not args.screenshot and install_frozen_release():
-        return 0
+    if args.install and not args.demo and not args.screenshot:
+        try:
+            if install_frozen_release():
+                return 0
+        except Exception as exc:
+            error_app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.critical(None, APP_NAME, str(exc) or "安裝失敗，請稍後重試。")
+            return 1
     scale_settings = QSettings(str(APP_DIR / "preview.ini"), QSettings.Format.IniFormat) if args.demo or args.screenshot else QSettings("EricTools", "CodexUsageWidget")
     configure_ui_scale(scale_settings)
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -2772,6 +2779,7 @@ def main() -> int:
         server.newConnection.connect(wake_existing)
     app.aboutToQuit.connect(widget.paste_controller.target.close)
     widget.show()
+    QTimer.singleShot(0, signal_startup_ready)
     if not args.demo and not args.screenshot and _setting_bool(widget.settings, "autostart", False):
         configure_autostart(True)
     exit_code = app.exec()

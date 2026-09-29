@@ -6,12 +6,36 @@ from test_token_usage import NOW, context, ledger, meta, report, response, scan,
 
 
 @pytest.mark.parametrize("model,expected", [
-    ("gpt-6-astra", 1.49), ("gpt-5.6-sol", .596),
+    ("gpt-6-astra", 1.49), ("gpt-6-sol", .298), ("gpt-6-luna", .0149),
+    ("gpt-5.6-sol", .596),
     ("gpt-5.6", .596), ("gpt-5.6-terra", .33), ("gpt-5.6-luna", .033),
 ])
 def test_cached_read_write_and_output_are_billed_once(model, expected):
     # 一般輸入 40k、快取讀取 40k、寫入 20k、輸出 16k。
     assert estimate_response_usd(model, 100_000, 40_000, 20_000, 16_000) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("model,input_cost,cached_cost,write_cost,output_cost", [
+    ("gpt-6-sol", .2, .02, .25, 1.0),
+    ("gpt-6-luna", .01, .001, .0125, .05),
+])
+def test_new_models_use_each_official_standard_rate(
+    model, input_cost, cached_cost, write_cost, output_cost
+):
+    # 用短上下文逐項核對單價，避免長上下文加價影響結果。
+    assert estimate_response_usd(model, 100_000, 0, 0, 0) == pytest.approx(input_cost)
+    assert estimate_response_usd(model, 100_000, 100_000, 0, 0) == pytest.approx(cached_cost)
+    assert estimate_response_usd(model, 100_000, 0, 100_000, 0) == pytest.approx(write_cost)
+    assert estimate_response_usd(model, 0, 0, 0, 100_000) == pytest.approx(output_cost)
+
+
+@pytest.mark.parametrize("model,at_threshold,above_threshold", [
+    ("gpt-6-sol", .294, .538004),
+    ("gpt-6-luna", .0147, .0269002),
+])
+def test_new_model_long_context_boundary(model, at_threshold, above_threshold):
+    assert estimate_response_usd(model, 272_000, 200_000, 20_000, 10_000) == pytest.approx(at_threshold)
+    assert estimate_response_usd(model, 272_001, 200_000, 20_000, 10_000) == pytest.approx(above_threshold)
 
 
 def test_long_context_threshold_uses_entire_response():

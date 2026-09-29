@@ -6,6 +6,8 @@ Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude C
 
 [下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.4 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.4) · [驗證紀錄](驗證紀錄.md)
 
+此分支為 **v1.4.5 待發布修訂**：補上 GPT-6 Sol／Luna 估價、更新下載校驗與失敗回復、提醒依序顯示，以及懸浮圖示的來源／同步狀態與鍵盤操作。完整變更與測試方式見[驗證紀錄](驗證紀錄.md)。
+
 <img src="token-preview.png" width="340" alt="Quota PromptDock 主畫面；數字與指令為示範資料">
 
 ## 主要功能
@@ -36,6 +38,8 @@ Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude C
 
 安裝位置為 `%LOCALAPPDATA%\Programs\QuotaDock\QuotaDock.exe`。升級會沿用既有設定、常用指令及 Token 資料庫。
 
+v1.4.5 的自動更新會依 GitHub 版本附件資訊核對下載大小與 SHA-256，先完成暫存才關閉舊程式。安裝後會等待新版主視窗進入事件迴圈；失敗時嘗試還原程式、桌面捷徑與開機設定，安裝目錄保留上一版 `QuotaDock.exe.bak`。這是下載完整性校驗，並非 Windows 程式碼簽章。
+
 ## 額度與主畫面
 
 畫面順序為 **額度資訊 → Codex Token 用量 → 常用指令 → 底部操作**。
@@ -45,6 +49,8 @@ Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude C
 - Codex 透過本機 App Server 的 `account/rateLimits/read` 查詢；Claude Code 的額度卡片位於 Codex 下方。
 - 視窗會依內容與螢幕高度調整。正常版面保留圓環在上、額度卡片在下；空間不足時會縮小摘要或使用捲動區，常用指令與底部操作仍可使用。
 - 可拖曳頂部移動視窗；右上角「—」可收合為側邊懸浮圖示，系統匣選單可顯示或結束程式。
+- 懸浮圖示標示實際資料來源；指定來源沒有資料時顯示缺漏。同步失敗會保留舊值並加上提示，滑鼠提示可查看資料時間。圖示取得焦點後可按 Enter 或空白鍵展開。
+- 多個額度提醒同時出現時依序顯示，關閉目前提醒會接續下一則。
 
 ## Codex Token 用量
 
@@ -71,6 +77,7 @@ Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude C
 
 - 讀取 `CODEX_HOME` 指定的目錄；未設定時使用使用者的 `.codex`，涵蓋 `sessions` 與 `archived_sessions`。
 - 首次在背景逐行、分批整理歷史。運行中每 10 秒讀取新增內容，每 60 秒尋找新檔案；「立即更新」也會觸發檢查。
+- 未變動的來源略過開檔；每小時及按下「立即更新」時進行完整雜湊巡檢，可辨識保留大小與修改時間的改寫。統計內容不變時不重建明細表格。
 - 使用 `token_usage_record.usage` 的逐次回應用量，以 `response_id` 去重，並透過回合 UUID 對應當時記錄的模型與推理強度。一個回合有多次回應時會全部累計。
 - **快取輸入已包含在輸入 Token，推理已包含在輸出 Token**，不再次加進總量；也不將逐次用量與回合／對話累計相加。
 - 隱藏區塊仍會背景收錄。App 關閉期間 Codex 留下的紀錄，下次啟動時補入；重新掃描、封存搬移或 fork 的相同回應不重複加總。
@@ -91,7 +98,7 @@ Token 小卡與明細視窗顯示 **API 等值美元估算**，模型列、各�
 
 <img src="docs/api-cost-preview.png" width="340" alt="v1.4.4 API 等值美元估算；數字為示範資料">
 
-- 價格表於 **2026-09-16** 核對 [OpenAI 官方 Standard 價格](https://developers.openai.com/api/docs/pricing)，涵蓋 GPT-6 Astra、GPT-5.6 Sol／Terra／Luna 與 [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5)。歷史用量統一以此價格比較；更新內建價格表需更新程式。
+- 價格表於 **2026-09-29** 補入 [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol) 與 [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) 的 Standard 單價，並涵蓋既有 GPT-6 Astra、GPT-5.6 Sol／Terra／Luna 與 [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5)。歷史用量統一以此價格比較；更新內建價格表需更新程式。
 - 每次回應分別計算一般輸入、快取讀取、快取寫入及輸出費用，之後才按模型、回合及日期加總。快取從一般輸入扣除；推理已含在輸出，不再次計費。
 - 單次輸入超過 272,000 Token 時，輸入與快取費率乘 2、輸出費率乘 1.5；不以整日或整回合的累計 Token 判斷。
 - 模型單價未知、必要快取明細缺漏或明細不一致時不猜價。部分回應可估算時標示「部分」，全部不可估算顯示「無法估算」，無回應顯示 `—`；小於一美分但大於零時顯示 `< US$0.01`。

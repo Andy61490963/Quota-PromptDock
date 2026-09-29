@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QPoint, QRect, QSize
@@ -12,6 +13,7 @@ from app import (
     is_newer_version,
     parse_release,
     ClaudeCliLocator,
+    ClaudeUsageClient,
     ClaudeUsageSnapshot,
     UsageSnapshot,
     UsageWindow,
@@ -19,6 +21,7 @@ from app import (
     detect_cycle_reset,
     duration_label,
     mini_remaining,
+    mini_usage_display,
     reset_time_label,
 )
 
@@ -158,13 +161,24 @@ def test_mini_source_selects_the_right_provider() -> None:
     assert mini_remaining("min", codex, claude) == 10
 
 
-def test_mini_source_falls_back_when_provider_has_no_data() -> None:
+def test_mini_source_does_not_show_another_provider_when_selected_one_has_no_data() -> None:
     codex = snapshot(60, 2_000)
     empty_claude = ClaudeUsageSnapshot.unavailable(installed=True)
-    assert mini_remaining("claude", codex, empty_claude) == 40
-    assert mini_remaining("claude", codex, None) == 40
-    assert mini_remaining("codex", None, claude_snapshot(20, 50)) == 50
+    assert mini_remaining("claude", codex, empty_claude) is None
+    assert mini_remaining("claude", codex, None) is None
+    assert mini_remaining("codex", None, claude_snapshot(20, 50)) is None
+    assert mini_remaining("min", codex, empty_claude) == 40
     assert mini_remaining("min", None, None) is None
+
+
+def test_mini_display_identifies_actual_provider_and_update_time() -> None:
+    codex = snapshot(60, 2_000)
+    display = mini_usage_display("min", codex, claude_snapshot(10, 90))
+    assert display is not None
+    assert display.remaining_percent == 10
+    assert display.provider == "Claude Code"
+    assert display.window == "7 天"
+    assert display.fetched_at > 0
 
 
 def make_exe(path: Path) -> Path:
@@ -281,6 +295,20 @@ def test_claude_usage_response_parsing() -> None:
     assert value.five_hour.remaining_percent == 66
     assert value.seven_day is not None
     assert value.seven_day.remaining_percent == 39
+
+
+def test_invalid_claude_auth_json_is_not_reported_as_logged_out(monkeypatch) -> None:
+    monkeypatch.setattr(ClaudeCliLocator, "locate_detailed", staticmethod(lambda: (Path("claude.exe"), False)))
+    monkeypatch.setattr(app_module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout="not json", returncode=1))
+    with pytest.raises(RuntimeError, match="登入狀態暫時無法讀取"):
+        ClaudeUsageClient().fetch()
+
+
+def test_explicit_claude_logged_out_response_remains_logged_out(monkeypatch) -> None:
+    monkeypatch.setattr(ClaudeCliLocator, "locate_detailed", staticmethod(lambda: (Path("claude.exe"), False)))
+    monkeypatch.setattr(app_module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout='{"loggedIn": false}', returncode=1))
+    result = ClaudeUsageClient().fetch()
+    assert result.installed and not result.logged_in
 
 
 def test_saved_position_from_a_detached_monitor_is_pulled_back_on_screen() -> None:
