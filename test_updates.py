@@ -220,3 +220,77 @@ def test_readonly_backup_reports_step_and_keeps_installed_file(installation):
         assert backup.read_bytes() == b"previous-backup"
     finally:
         backup.chmod(0o666)
+
+
+def test_recovery_failure_is_reported_and_recorded_after_preserving_old_file(installation, tmp_path):
+    source, target = installation
+
+    def fail_launch():
+        raise OSError("新版測試啟動失敗")
+
+    def fail_recovery():
+        raise OSError("原版本測試重開失敗")
+
+    with pytest.raises(RuntimeError, match="自動重開失敗") as failure:
+        install_release(source, target, lambda: None, lambda: None, fail_launch,
+                        recover=fail_recovery)
+    assert target.read_bytes() == b"old-version"
+    assert "失敗步驟：重新開啟原版本" in str(failure.value)
+    path = updates.record_install_failure(failure.value, tmp_path / "紀錄", "測試版")
+    content = path.read_text(encoding="utf-8")
+    assert "新版測試啟動失敗" in content
+    assert "原版本測試重開失敗" in content
+
+
+def test_locked_staging_cleanup_keeps_the_original_install_error(installation, monkeypatch, tmp_path):
+    source, target = installation
+    unlink = Path.unlink
+
+    def fail_copy(src, dst):
+        raise OSError("原始暫存複製失敗")
+
+    def fail_cleanup(path, *args, **kwargs):
+        if path.name.startswith(".quota-install-"):
+            raise PermissionError("暫存檔仍遭占用")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(updates, "_copy_verified", fail_copy)
+    monkeypatch.setattr(Path, "unlink", fail_cleanup)
+    with pytest.raises(RuntimeError, match="原始暫存複製失敗") as failure:
+        install_release(source, target, lambda: None, lambda: None, lambda: None)
+    assert target.read_bytes() == b"old-version"
+    path = updates.record_install_failure(failure.value, tmp_path / "紀錄", "測試版")
+    assert "暫存檔尚未清除" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="驗證 Windows 存取拒絕的原因鏈")
+def test_missing_diagnostic_module_keeps_original_windows_error(installation, monkeypatch):
+    import ctypes
+    import sys
+
+    source, target = installation
+    replace = os.replace
+
+    def deny_target(src, dst):
+        if Path(dst) == target:
+            raise ctypes.WinError(5)
+        return replace(src, dst)
+
+    monkeypatch.setattr(updates.os, "replace", deny_target)
+    monkeypatch.setattr(updates, "FILE_REPLACE_TIMEOUT_SECONDS", 0)
+    monkeypatch.setitem(sys.modules, "windows_file_diagnostics", None)
+    with pytest.raises(RuntimeError, match="診斷無法取得") as failure:
+        install_release(source, target, lambda: None, lambda: None, lambda: None)
+    assert failure.value.__cause__.__cause__.winerror == 5
+    assert target.read_bytes() == b"old-version"
+
+
+def test_unresolved_process_pid_is_shown_without_powershell_command():
+    cause = subprocess.CalledProcessError(
+        1, ["powershell", "不可顯示的完整指令"],
+        stderr="無法核對執行中的 QuotaDock.exe（PID 1234），請先關閉該 App 再重試。".encode("utf-8"),
+    )
+    message = updates.install_failure_message("等待舊版結束", cause)
+    assert "PID 1234" in message
+    assert "請先關閉該 App" in message
+    assert "不可顯示的完整指令" not in message
