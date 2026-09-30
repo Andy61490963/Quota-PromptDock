@@ -20,6 +20,75 @@ RUN_VALUE_NAMES = ("QuotaDock", "CodexUsageWidget")
 STARTUP_TIMEOUT_SECONDS = 30.0
 
 
+_PROCESS_PATH_LOOKUP_SCRIPT = r"""
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class QuotaDockProcessPath {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+
+    [DllImport("kernel32.dll", EntryPoint = "QueryFullProcessImageNameW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder path, ref uint size);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static string GetPath(int processId) {
+        // PROCESS_QUERY_LIMITED_INFORMATION (0x1000) 加 SYNCHRONIZE，以便分辨查詢失敗與程序已結束。
+        IntPtr process = OpenProcess(0x00101000, false, processId);
+        if (process == IntPtr.Zero) {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 87) return null;
+            throw new Win32Exception(error);
+        }
+        try {
+            StringBuilder path = new StringBuilder(32768);
+            uint size = (uint)path.Capacity;
+            if (QueryFullProcessImageName(process, 0, path, ref size)) return path.ToString();
+            int error = Marshal.GetLastWin32Error();
+            if (WaitForSingleObject(process, 0) == 0) return null;
+            throw new Win32Exception(error);
+        } finally {
+            CloseHandle(process);
+        }
+    }
+}
+'@ -ErrorAction Stop
+
+function Get-QuotaRunning {
+    param([string]$Expected)
+    $expectedName = [IO.Path]::GetFileName($Expected)
+    foreach ($item in Get-CimInstance Win32_Process) {
+        $candidate = $item.ExecutablePath
+        if (-not $candidate -and $item.Name -ieq $expectedName) {
+            $targetPid = [int]$item.ProcessId
+            try {
+                $candidate = [QuotaDockProcessPath]::GetPath($targetPid)
+            } catch {
+                throw "無法核對執行中的 $expectedName（PID $targetPid），請先關閉該 App 再重試。"
+            }
+            if (-not $candidate) {
+                if (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) {
+                    throw "無法核對執行中的 $expectedName（PID $targetPid），請先關閉該 App 再重試。"
+                }
+                continue
+            }
+        }
+        if ($candidate -eq $Expected) { $item }
+    }
+}
+"""
+
+
 class StartupExitedError(RuntimeError):
     """區分單例喚醒的零退出碼與真正的新程序啟動錯誤。"""
 
@@ -220,10 +289,10 @@ def install_windows_release(source: Path, target: Path, autostart: bool) -> None
         # 只停止完整路徑相符的安裝版；先給視窗正常結束的機會。
         if origin is not None and not origin.handed_off:
             origin.stop()
-        powershell(
+        powershell(_PROCESS_PATH_LOOKUP_SCRIPT +
             "$ErrorActionPreference='Stop'; "
             "$target=[IO.Path]::GetFullPath($env:QUOTADOCK_INSTALL_TARGET); "
-            "$running=@(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $target}); "
+            "$running=@(Get-QuotaRunning $target); "
             "foreach($item in $running){ $targetPid=$item.ProcessId; "
             "$p=Get-Process -Id $targetPid -ErrorAction SilentlyContinue; "
             "if($p){ try { [void]$p.CloseMainWindow() } catch { "
@@ -234,7 +303,7 @@ def install_windows_release(source: Path, target: Path, autostart: bool) -> None
             "-or (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)){ throw } "
             "} } }; "
             "if($running.Count){ Start-Sleep -Seconds 2 }; "
-            "Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $target} | "
+            "Get-QuotaRunning $target | "
             "ForEach-Object { $targetPid=$_.ProcessId; "
             "try { Stop-Process -Id $targetPid -Force -ErrorAction Stop } "
             "catch [Microsoft.PowerShell.Commands.ProcessCommandException] { "
@@ -243,7 +312,7 @@ def install_windows_release(source: Path, target: Path, autostart: bool) -> None
             "-or (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) { throw } "
             "} }; "
             "$deadline=[DateTime]::UtcNow.AddSeconds(5); "
-            "while(@(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $target}).Count){ "
+            "while(@(Get-QuotaRunning $target).Count){ "
             "if([DateTime]::UtcNow -gt $deadline){ throw '無法停止既有安裝' }; Start-Sleep -Milliseconds 100 }"
         )
 

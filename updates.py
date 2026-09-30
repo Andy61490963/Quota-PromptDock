@@ -7,8 +7,11 @@ from datetime import datetime, timezone
 import os
 import re
 import shutil
+import stat
 import tempfile
 import subprocess
+import sys
+import time
 import traceback
 import urllib.parse
 import urllib.request
@@ -21,16 +24,26 @@ RELEASE_DOWNLOAD_PREFIX = f"https://github.com/{GITHUB_REPO}/releases/download/"
 RELEASE_ASSET = "QuotaDock-Windows-x64.exe"
 MIN_RELEASE_BYTES = 5_000_000
 MAX_RELEASE_BYTES = 512 * 1024 * 1024
+FILE_REPLACE_TIMEOUT_SECONDS = 10.0
 
 
 def install_failure_message(stage: str, cause: Exception) -> str:
     """介面保留失敗步驟與可讀原因，完整輔助程序輸出另存本機紀錄。"""
     if isinstance(cause, subprocess.CalledProcessError):
         reason = f"Windows 安裝輔助程序失敗（結束碼 {cause.returncode}）。"
+        stderr = cause.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        unresolved = re.search(r"無法核對執行中的 QuotaDock\.exe（PID (\d+)）", str(stderr))
+        if unresolved:
+            reason = f"無法核對原程式（PID {unresolved[1]}），請先關閉該 App 再重試。"
     elif isinstance(cause, subprocess.TimeoutExpired):
         reason = "Windows 安裝輔助程序回應逾時。"
     else:
         reason = str(cause).strip() or type(cause).__name__
+    notes = getattr(cause, "__notes__", ())
+    if notes:
+        reason += "\n" + "\n".join(notes)
     return f"\n失敗步驟：{stage}\n原因：{reason[:400]}"
 
 
@@ -57,6 +70,7 @@ def record_install_failure(error: Exception, directory: Path, version: str) -> P
                     details.append("安裝輔助程序錯誤輸出：\n" + str(stderr)[:8192])
             else:
                 details.append(f"{type(current).__name__}: {current}")
+            details.extend(getattr(current, "__notes__", ()))
             current = current.__cause__ or current.__context__
         if path.exists() and path.stat().st_size >= 128 * 1024:
             os.replace(path, directory / "install.previous.log")
@@ -164,6 +178,41 @@ def _copy_verified(source: Path, target: Path) -> None:
         os.fsync(copied.fileno())
 
 
+def _replace_install_file(source: Path, target: Path) -> None:
+    """只等待 Windows 的存取／共享鎖解除；不改權限、不刪除原檔。"""
+    deadline = time.monotonic() + FILE_REPLACE_TIMEOUT_SECONDS
+    delay = 0.1
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except OSError as exc:
+            if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32, 33):
+                raise
+            try:
+                readonly = bool(target.stat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+            except OSError:
+                readonly = False
+            if readonly:
+                exc.add_note("目標檔案設為唯讀，未變更其屬性或權限；請確認檔案內容中的唯讀設定。")
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                try:
+                    from windows_file_diagnostics import describe_file_access
+
+                    details = describe_file_access(source, target)
+                except Exception as diagnostic_error:
+                    details = f"占用診斷無法取得（{type(diagnostic_error).__name__}），無法判定占用狀態。"
+                raise RuntimeError(
+                    f"已等待 {FILE_REPLACE_TIMEOUT_SECONDS:g} 秒，Windows 仍無法替換檔案。\n"
+                    f"{details}\n請先結束這台電腦上的 Quota PromptDock 後重試；"
+                    "若仍失敗，請提供安裝紀錄。"
+                ) from exc
+            time.sleep(min(delay, remaining))
+            delay = min(0.5, delay * 2)
+
+
 def install_release(
     source: Path,
     target: Path,
@@ -196,9 +245,9 @@ def install_release(
             with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".quota-backup-", suffix=".exe", delete=False) as handle:
                 backup_stage = Path(handle.name)
             _copy_verified(target, backup_stage)
-            os.replace(backup_stage, backup)
+            _replace_install_file(backup_stage, backup)
         stage = "替換程式"
-        os.replace(staged, target)
+        _replace_install_file(staged, target)
         replaced = True
         stage = "啟動新版"
         launch()
@@ -221,7 +270,7 @@ def install_release(
                 if stop_error is not None:
                     raise stop_error
                 if existed:
-                    os.replace(backup, target)
+                    _replace_install_file(backup, target)
                 else:
                     target.unlink(missing_ok=True)
             except Exception as restore_error:
@@ -231,18 +280,30 @@ def install_release(
                     message += " 捷徑或開機設定也需要重新確認。"
                 raise RuntimeError(message + install_failure_message(stage, exc)
                                    + install_failure_message("還原程式", restore_error)) from restore_error
+        recovery_error = None
         if stop_attempted and (existed or recover is not None):
             try:
                 (recover or launch)()
-            except Exception:
-                pass
+            except Exception as error:
+                recovery_error = error
+        recovery_message = ("\n原版本檔案已保留，但自動重開失敗；請手動開啟原來的 App。"
+                            + install_failure_message("重新開啟原版本", recovery_error)
+                            if recovery_error is not None else "")
         if settings_error is not None:
             raise RuntimeError("安裝失敗，程式已還原；捷徑或開機設定需要重新確認。"
                                + install_failure_message(stage, exc)
-                               + install_failure_message("還原安裝設定", settings_error)) from settings_error
+                               + install_failure_message("還原安裝設定", settings_error)
+                               + recovery_message) from settings_error
         message = "安裝失敗，已保留原版本；請稍後重試。" if existed else "安裝未完成，請稍後重試。"
-        raise RuntimeError(message + install_failure_message(stage, exc)) from exc
+        raise RuntimeError(message + install_failure_message(stage, exc)
+                           + recovery_message) from (recovery_error or exc)
     finally:
+        pending_error = sys.exception()
         for temporary in (staged, backup_stage):
             if temporary is not None:
-                temporary.unlink(missing_ok=True)
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    if pending_error is None:
+                        raise
+                    pending_error.add_note(f"暫存檔尚未清除：{cleanup_error}")

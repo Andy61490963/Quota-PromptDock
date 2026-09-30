@@ -36,6 +36,33 @@ jobs:
         shell: pwsh
         run: .\build_release.ps1
 
+      - name: 下載前一正式版並驗證真正 EXE 升級與回復
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = gh api "repos/$env:GH_REPO/releases/latest"
+          if ($LASTEXITCODE -ne 0) { throw '無法取得前一正式版，發布驗證不可略過。' }
+          $previous = $metadata | ConvertFrom-Json
+          if ($previous.draft -or $previous.prerelease -or $previous.tag_name -eq $env:GITHUB_REF_NAME) {
+            throw '找不到適用的前一正式版，發布驗證不可略過。'
+          }
+          $asset = @($previous.assets | Where-Object { $_.name -eq 'QuotaDock-Windows-x64.exe' })
+          if ($asset.Count -ne 1 -or $asset[0].digest -notmatch '^sha256:[a-fA-F0-9]{64}$') {
+            throw '前一正式版缺少唯一 EXE 或 SHA-256 校驗，發布驗證不可略過。'
+          }
+          New-Item -ItemType Directory -Force -Path build/previous-release | Out-Null
+          gh release download $previous.tag_name --pattern QuotaDock-Windows-x64.exe --dir build/previous-release --clobber
+          if ($LASTEXITCODE -ne 0) { throw '下載前一正式版失敗。' }
+          $oldExe = 'build/previous-release/QuotaDock-Windows-x64.exe'
+          $actualHash = (Get-FileHash -LiteralPath $oldExe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ("sha256:$actualHash" -ne $asset[0].digest.ToLowerInvariant()) { throw '前一正式版 SHA-256 不符。' }
+          Write-Host "驗證 $($previous.tag_name) 升級至 $env:GITHUB_REF_NAME"
+          python tools/verify_packaged_upgrade.py --old-exe $oldExe --new-exe release/QuotaDock-Windows-x64.exe
+          if ($LASTEXITCODE -ne 0) { throw '真正 EXE 升級或失敗回復驗證失敗。' }
+
       - name: 保留已驗證的發布產物
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
