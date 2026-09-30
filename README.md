@@ -2,11 +2,13 @@
 
 Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude Code 剩餘額度、依模型與推理強度追蹤 Codex 本機 Token 用量，並將常用指令一鍵貼到目前使用的 AI 工具。
 
-**目前正式版：v1.4.5** · Windows x64 · 繁體中文 · 不需安裝 Python
+**目前正式版：v1.4.6** · Windows x64 · 繁體中文 · 不需安裝 Python
 
-[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.5 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.5) · [驗證紀錄](驗證紀錄.md)
+[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.6 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.6) · [驗證紀錄](驗證紀錄.md)
 
 **v1.4.5 更新重點**：首次使用引導、懸浮額度摘要、指令搜尋與預覽，以及 GPT-6 Sol／Luna 估價、更新校驗與回復、通知和背景效能修正。完整變更見[版本說明](docs/發布說明-v1.4.5.md)，測試方式見[驗證紀錄](驗證紀錄.md)。
+
+**v1.4.6 修補更新**：修正 App 內更新時舊版退出的競態，等待舊免安裝版釋放視窗服務，並顯示安裝失敗步驟與診斷紀錄。詳見[修補說明](docs/發布說明-v1.4.6.md)。
 
 <img src="token-preview.png" width="340" alt="Quota PromptDock 主畫面；數字與指令為示範資料">
 
@@ -42,6 +44,8 @@ Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude C
 安裝位置為 `%LOCALAPPDATA%\Programs\QuotaDock\QuotaDock.exe`。升級會沿用既有設定、常用指令及 Token 資料庫。
 
 v1.4.5 的自動更新會依 GitHub 版本附件資訊核對下載大小與 SHA-256，先完成暫存才關閉舊程式。安裝後會等待新版主視窗進入事件迴圈；失敗時嘗試還原程式、桌面捷徑與開機設定，安裝目錄保留上一版 `QuotaDock.exe.bak`。這是下載完整性校驗，並非 Windows 程式碼簽章。
+
+若舊版仍顯示 v1.4.5 的更新按鈕，請從系統匣結束程式後重新開啟，取得最新 v1.4.6 的更新資訊。v1.4.6 的安裝錯誤會顯示失敗步驟與原因，完整診斷保存在 `%LOCALAPPDATA%\CodexUsageWidget\install.log`。提供錯誤訊息與這份紀錄即可協助排查。
 
 ### 首次使用與連線引導
 

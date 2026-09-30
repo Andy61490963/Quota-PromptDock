@@ -2,7 +2,9 @@
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -135,8 +137,11 @@ def test_failed_install_restores_and_restarts_old_version(installation, monkeypa
         launches.append(version)
         if failure == "launch" and version == b"new-version":
             raise OSError("模擬新版無法啟動")
-    with pytest.raises(RuntimeError, match="保留原版本"):
+    with pytest.raises(RuntimeError, match="保留原版本") as failure_info:
         install_release(source, target, lambda: None, finish, launch)
+    stage = {"replace": "替換程式", "finish": "更新捷徑與開機設定", "launch": "啟動新版"}[failure]
+    assert f"失敗步驟：{stage}" in str(failure_info.value)
+    assert "原因：模擬" in str(failure_info.value)
     assert target.read_bytes() == b"old-version"
     assert launches[-1] == b"old-version"
     assert not list(target.parent.glob(".quota-*"))
@@ -166,3 +171,52 @@ def test_failed_stop_during_rollback_still_restores_settings(installation):
                         rollback_settings=lambda: events.append("rollback_settings"))
     assert events == ["stop", "stop", "rollback_settings"]
     assert target.with_name("QuotaDock.exe.bak").read_bytes() == b"old-version"
+
+
+def test_install_failure_record_keeps_cause_and_helper_stderr(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRIVATE_CREDENTIAL", "不可寫入診斷紀錄的測試值")
+    command_marker = "不可保存的子程序" + "命令參數"
+    try:
+        try:
+            raise subprocess.CalledProcessError(1, ["powershell.exe", "-Command", command_marker],
+                                                stderr="拒絕存取：測試路徑".encode("utf-8"))
+        except subprocess.CalledProcessError as cause:
+            raise RuntimeError("失敗步驟：等待舊版結束") from cause
+    except RuntimeError as error:
+        path = updates.record_install_failure(error, tmp_path, "1.4.6")
+    content = path.read_text(encoding="utf-8")
+    assert "等待舊版結束" in content
+    assert "拒絕存取：測試路徑" in content
+    assert "CalledProcessError" in content
+    assert "安裝版本：1.4.6" in content
+    assert "PRIVATE_CREDENTIAL" not in content
+    assert "不可寫入診斷紀錄的測試值" not in content
+    assert command_marker not in content
+
+
+def test_install_failure_record_rotates_and_handles_unwritable_directory(tmp_path):
+    path = tmp_path / "install.log"
+    path.write_text("x" * (128 * 1024), encoding="utf-8")
+    assert updates.record_install_failure(RuntimeError("本次安裝失敗"), tmp_path, "1.4.6") == path
+    assert (tmp_path / "install.previous.log").stat().st_size == 128 * 1024
+    assert "本次安裝失敗" in path.read_text(encoding="utf-8")
+    blocked = tmp_path / "不可作為資料夾"
+    blocked.write_text("保留原檔", encoding="utf-8")
+    assert updates.record_install_failure(RuntimeError("原始錯誤"), blocked, "1.4.6") is None
+    assert blocked.read_text(encoding="utf-8") == "保留原檔"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 唯讀檔案行為")
+def test_readonly_backup_reports_step_and_keeps_installed_file(installation):
+    source, target = installation
+    backup = target.with_name("QuotaDock.exe.bak")
+    backup.write_bytes(b"previous-backup")
+    backup.chmod(0o444)
+    try:
+        with pytest.raises(RuntimeError, match="失敗步驟：備份原版本") as failure:
+            install_release(source, target, lambda: None, lambda: None, lambda: None)
+        assert isinstance(failure.value.__cause__, PermissionError)
+        assert target.read_bytes() == b"old-version"
+        assert backup.read_bytes() == b"previous-backup"
+    finally:
+        backup.chmod(0o666)

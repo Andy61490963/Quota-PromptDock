@@ -1,5 +1,7 @@
 """安裝設定失敗時，桌面捷徑與開機啟動值必須回到原狀。"""
 import base64
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +9,125 @@ from types import SimpleNamespace
 import pytest
 
 import windows_install as wi
+from updates import record_install_failure
+
+
+def _run_stop_script_with_cim(tmp_path, monkeypatch, prelude: str) -> None:
+    real_run = subprocess.run
+    monkeypatch.setattr(wi.UpdateOrigin, "from_environment", classmethod(lambda cls: None))
+    monkeypatch.setattr(wi, "_desktop_path", lambda powershell: tmp_path)
+    monkeypatch.setattr(wi, "_snapshot_run_values", lambda: {})
+    monkeypatch.setattr(wi, "install_release",
+                        lambda source, target, stop_running, finish_install, launch, **callbacks: stop_running())
+
+    def run_with_fake_cim(args, **kwargs):
+        assert "Get-CimInstance Win32_Process" in args[-1]
+        return real_run([*args[:-1], prelude + args[-1]], **kwargs)
+
+    monkeypatch.setattr(wi.subprocess, "run", run_with_fake_cim)
+    wi.install_windows_release(tmp_path / "download.exe", tmp_path / "installed" / "QuotaDock.exe", False)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="驗證 Windows PowerShell 程序結束競態")
+def test_stop_running_ignores_process_that_exited_after_cim_query(tmp_path, monkeypatch):
+    prelude = (
+        "$script:query=0; function Get-CimInstance { param($ClassName) "
+        "$script:query++; if($script:query -eq 2){ [pscustomobject]@{ "
+        "ExecutablePath=$env:QUOTADOCK_INSTALL_TARGET; ProcessId=2147483647 } } }; "
+    )
+    _run_stop_script_with_cim(tmp_path, monkeypatch, prelude)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="驗證 Windows PowerShell 程序結束競態")
+def test_stop_running_rejects_process_that_is_still_visible(tmp_path, monkeypatch):
+    prelude = (
+        "$script:query=0; function Get-CimInstance { param($ClassName) "
+        "$script:query++; if($script:query -eq 2){ [pscustomobject]@{ "
+        "ExecutablePath=$env:QUOTADOCK_INSTALL_TARGET; ProcessId=2147483647 } } }; "
+        "function Get-Process { param($Id) [pscustomobject]@{ Id=$Id } }; "
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_stop_script_with_cim(tmp_path, monkeypatch, prelude)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="驗證 Windows PowerShell 權限拒絕仍是失敗")
+def test_stop_running_preserves_permission_failure(tmp_path, monkeypatch):
+    prelude = (
+        "$script:query=0; function Get-CimInstance { param($ClassName) "
+        "$script:query++; if($script:query -eq 2){ [pscustomobject]@{ "
+        "ExecutablePath=$env:QUOTADOCK_INSTALL_TARGET; ProcessId=2147483647 } } }; "
+        "function Stop-Process { throw [System.UnauthorizedAccessException]::new('denied') }; "
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_stop_script_with_cim(tmp_path, monkeypatch, prelude)
+
+
+def _close_main_window_prelude(*, alive_after_failure: bool, failure_type: str) -> str:
+    lookups = "2" if alive_after_failure else "1"
+    return (
+        "Add-Type -TypeDefinition 'public class QuotaProbeProcess { "
+        "public int Id {get;set;} public bool CloseMainWindow() { "
+        f"throw new System.{failure_type}(\"probe\"); "
+        "} }'; "
+        "$script:query=0; function Get-CimInstance { param($ClassName) "
+        "$script:query++; if($script:query -eq 1){ [pscustomobject]@{ "
+        "ExecutablePath=$env:QUOTADOCK_INSTALL_TARGET; ProcessId=2147483647 } } }; "
+        "$script:lookups=0; function Get-Process { param($Id) "
+        f"$script:lookups++; if($script:lookups -le {lookups}){{ "
+        "$p=[QuotaProbeProcess]::new(); $p.Id=$Id; $p } }; "
+        "function Start-Sleep { }; "
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="驗證 Windows PowerShell 關閉視窗競態")
+def test_close_main_window_ignores_process_that_exited(tmp_path, monkeypatch):
+    _run_stop_script_with_cim(
+        tmp_path, monkeypatch,
+        _close_main_window_prelude(alive_after_failure=False, failure_type="InvalidOperationException"),
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="驗證 Windows PowerShell 關閉視窗競態")
+def test_close_main_window_rejects_still_running_process(tmp_path, monkeypatch):
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_stop_script_with_cim(
+            tmp_path, monkeypatch,
+            _close_main_window_prelude(alive_after_failure=True, failure_type="InvalidOperationException"),
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="驗證 Windows PowerShell 權限拒絕仍是失敗")
+def test_close_main_window_preserves_permission_failure(tmp_path, monkeypatch):
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_stop_script_with_cim(
+            tmp_path, monkeypatch,
+            _close_main_window_prelude(alive_after_failure=False, failure_type="UnauthorizedAccessException"),
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="驗證 Windows PowerShell 中文錯誤編碼")
+def test_powershell_chinese_error_is_readable_in_install_log(tmp_path, monkeypatch):
+    real_run = subprocess.run
+    monkeypatch.setattr(wi.UpdateOrigin, "from_environment", classmethod(lambda cls: None))
+    monkeypatch.setattr(wi, "_desktop_path", lambda powershell: tmp_path)
+    monkeypatch.setattr(wi, "_snapshot_run_values", lambda: {})
+    monkeypatch.setattr(wi, "install_release",
+                        lambda source, target, stop_running, finish_install, launch, **callbacks: stop_running())
+    encoding_prefix = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); "
+    chinese_error = "拒絕存取：測試路徑"
+
+    def run_with_chinese_error(args, **kwargs):
+        assert args[-1].startswith(encoding_prefix)
+        return real_run([*args[:-1], encoding_prefix + f"throw '{chinese_error}'"], **kwargs)
+
+    monkeypatch.setattr(wi.subprocess, "run", run_with_chinese_error)
+    with pytest.raises(subprocess.CalledProcessError) as failure:
+        wi.install_windows_release(tmp_path / "download.exe", tmp_path / "installed" / "QuotaDock.exe", False)
+    log = record_install_failure(failure.value, tmp_path, "1.4.6")
+    assert log is not None
+    content = log.read_text(encoding="utf-8")
+    assert chinese_error in content
+    assert "�" not in content
 
 
 def test_desktop_location_preserves_unicode_path():
