@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
 from prompt_tools import PasteController, PromptPanel, PromptStore
 from token_panel import SHOW_TOKEN_SETTING, TokenUsagePanel, TokenUsageService, demo_report
 from odometer import DigitRoller, OdometerLabel
-from updates import UpdateChecker, parse_release, GITHUB_REPO, RELEASE_API, RELEASE_DOWNLOAD_PREFIX, RELEASE_ASSET
+from updates import UpdateChecker, parse_release, record_install_failure, GITHUB_REPO, RELEASE_API, RELEASE_DOWNLOAD_PREFIX, RELEASE_ASSET
 from windows_install import install_windows_release, signal_startup_ready, set_frozen_autostart as _set_frozen_autostart
 from install_handoff import handoff_environment, wait_for_handoff, schedule_download_cleanup, discard_download
 from onboarding import OnboardingDialog
@@ -54,7 +54,7 @@ from quota_summary import QuotaSummaryCard, QuotaSummaryRow
 
 
 APP_NAME = "Quota PromptDock"
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.4.6"
 UI_SCALE_SETTING = "ui_scale_percent"
 UI_SCALE_CHOICES = (75, 90, 100, 110, 125, 150)
 TAIWAN_TZ = timezone(timedelta(hours=8))
@@ -2856,6 +2856,11 @@ def install_frozen_release() -> bool:
     autostart = _setting_bool(QSettings("EricTools", "CodexUsageWidget"), "autostart", False)
     try:
         install_windows_release(current, target, autostart)
+    except Exception as exc:
+        log_path = record_install_failure(exc, APP_DIR, APP_VERSION)
+        if log_path is not None:
+            raise RuntimeError(f"{exc}\n\n安裝紀錄：{log_path}") from exc
+        raise
     finally:
         schedule_download_cleanup(current)
     return True

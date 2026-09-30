@@ -17,6 +17,15 @@ READY_PATH_ENV = "QUOTA_PROMPTDOCK_READY_FILE"
 READY_TOKEN_ENV = "QUOTA_PROMPTDOCK_READY_TOKEN"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAMES = ("QuotaDock", "CodexUsageWidget")
+STARTUP_TIMEOUT_SECONDS = 30.0
+
+
+class StartupExitedError(RuntimeError):
+    """區分單例喚醒的零退出碼與真正的新程序啟動錯誤。"""
+
+    def __init__(self, exit_code: int):
+        self.exit_code = exit_code
+        super().__init__(f"新版在完成啟動前結束（結束碼 {exit_code}），正在還原原版本。")
 
 
 def signal_startup_ready() -> None:
@@ -34,8 +43,9 @@ def signal_startup_ready() -> None:
 def wait_for_startup(process, ready_path: Path, token: str, timeout: float = 30.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError("新版在完成啟動前結束，正在還原原版本。")
+        exit_code = process.poll()
+        if exit_code is not None:
+            raise StartupExitedError(exit_code)
         try:
             if ready_path.read_text(encoding="utf-8") == token:
                 return
@@ -200,6 +210,8 @@ def install_windows_release(source: Path, target: Path, autostart: bool) -> None
     environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
 
     def powershell(script: str):
+        # 固定捕捉輸出的編碼，讓不同 Windows 語系的安裝錯誤都能寫入可讀紀錄。
+        script = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); " + script
         return subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
                               check=True, timeout=25, capture_output=True,
                               creationflags=CREATE_NO_WINDOW, env=environment)
@@ -212,11 +224,24 @@ def install_windows_release(source: Path, target: Path, autostart: bool) -> None
             "$ErrorActionPreference='Stop'; "
             "$target=[IO.Path]::GetFullPath($env:QUOTADOCK_INSTALL_TARGET); "
             "$running=@(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $target}); "
-            "foreach($item in $running){ $p=Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue; "
-            "if($p){ [void]$p.CloseMainWindow() } }; "
+            "foreach($item in $running){ $targetPid=$item.ProcessId; "
+            "$p=Get-Process -Id $targetPid -ErrorAction SilentlyContinue; "
+            "if($p){ try { [void]$p.CloseMainWindow() } catch { "
+            "$reason=$_.Exception; "
+            "if($reason -is [System.Management.Automation.MethodInvocationException]) "
+            "{ $reason=$reason.InnerException }; "
+            "if($reason -isnot [System.InvalidOperationException] "
+            "-or (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)){ throw } "
+            "} } }; "
             "if($running.Count){ Start-Sleep -Seconds 2 }; "
             "Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $target} | "
-            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }; "
+            "ForEach-Object { $targetPid=$_.ProcessId; "
+            "try { Stop-Process -Id $targetPid -Force -ErrorAction Stop } "
+            "catch [Microsoft.PowerShell.Commands.ProcessCommandException] { "
+            "if ($_.FullyQualifiedErrorId -ne "
+            "'NoProcessFoundForGivenId,Microsoft.PowerShell.Commands.StopProcessCommand' "
+            "-or (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) { throw } "
+            "} }; "
             "$deadline=[DateTime]::UtcNow.AddSeconds(5); "
             "while(@(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $target}).Count){ "
             "if([DateTime]::UtcNow -gt $deadline){ throw '無法停止既有安裝' }; Start-Sleep -Milliseconds 100 }"
@@ -245,13 +270,33 @@ def install_windows_release(source: Path, target: Path, autostart: bool) -> None
     def launch() -> None:
         with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".quota-ready-", delete=False) as handle:
             ready_path = Path(handle.name)
-        token = uuid.uuid4().hex
-        launch_environment = environment | {READY_PATH_ENV: str(ready_path), READY_TOKEN_ENV: token}
         process = None
+        deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+        retry_delay = 0.5
         try:
-            process = subprocess.Popen([str(target)], cwd=str(target.parent), env=launch_environment,
-                                       close_fds=True, creationflags=CREATE_NO_WINDOW)
-            wait_for_startup(process, ready_path, token)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("等待舊程式結束逾時；請從系統匣結束舊版後重新更新。")
+                token = uuid.uuid4().hex
+                ready_path.write_text("", encoding="utf-8")
+                launch_environment = environment | {READY_PATH_ENV: str(ready_path), READY_TOKEN_ENV: token}
+                process = subprocess.Popen([str(target)], cwd=str(target.parent), env=launch_environment,
+                                           close_fds=True, creationflags=CREATE_NO_WINDOW)
+                try:
+                    wait_for_startup(process, ready_path, token, max(0.0, deadline - time.monotonic()))
+                    break
+                except StartupExitedError as exc:
+                    # v1.4.4 沒有交接協定；舊 portable 尚未釋放單例服務時，新版會喚醒舊版並退出 0。
+                    # 只在上一個程序確實結束後重試，且所有嘗試共用同一個啟動期限。
+                    try:
+                        already_ready = ready_path.read_text(encoding="utf-8") == token
+                    except OSError:
+                        already_ready = False
+                    if exc.exit_code != 0 or already_ready:
+                        raise
+                    time.sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
+                    retry_delay = min(2.0, retry_delay * 2)
         except Exception:
             if process is not None:
                 try:
