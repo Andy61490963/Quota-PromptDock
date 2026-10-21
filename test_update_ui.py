@@ -72,12 +72,13 @@ def test_frozen_install_failure_exposes_saved_diagnostic(widget, tmp_path, monke
     monkeypatch.setattr(app, "QSettings", lambda *args: widget.settings)
     cleaned = []
     monkeypatch.setattr(app, "schedule_download_cleanup", cleaned.append)
-    def fail(*args):
+    def fail(*args, **kwargs):
         try:
             raise subprocess.CalledProcessError(1, ["powershell.exe"], stderr=b"NoProcessFoundForGivenId")
         except subprocess.CalledProcessError as cause:
             raise RuntimeError("安裝失敗。\n失敗步驟：等待舊版結束") from cause
     monkeypatch.setattr(app, "install_versioned_release", fail)
+    monkeypatch.setattr(app, "bundled_launcher", lambda: tmp_path / "launcher.exe")
     with pytest.raises(RuntimeError, match="安裝紀錄：") as result:
         app.install_frozen_release()
     path = tmp_path / "install.log"

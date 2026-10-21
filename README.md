@@ -2,9 +2,11 @@
 
 Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude Code 剩餘額度、依模型與推理強度追蹤 Codex 本機 Token 用量，並將常用指令一鍵貼到目前使用的 AI 工具。
 
-**目前正式版：v1.4.10** · Windows x64 · 繁體中文 · 不需安裝 Python
+**目前正式版：v1.4.11** · Windows x64 · 繁體中文 · 不需安裝 Python
 
-[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.10 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.10) · [驗證紀錄](驗證紀錄.md)
+[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.11 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.11) · [驗證紀錄](驗證紀錄.md)
+
+**v1.4.11**：修正工作列釘選在更新後仍開到舊版。桌面、開機啟動與可確認的既有釘選改用固定啟動程式，關閉後仍開啟目前啟用版本。詳見[版本說明](docs/發布說明-v1.4.11.md)。
 
 **v1.4.10**：Token 小卡改為用量／API 等值費用雙欄，顯示回應次數與精簡價格同步時間；單一模型省略滿格長條，統計缺漏與同步失敗使用醒目提示。詳見[版本說明](docs/發布說明-v1.4.10.md)。
 
@@ -49,7 +51,7 @@ Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude C
 .\QuotaDock-Windows-x64.exe --install
 ```
 
-安裝位置為 `%LOCALAPPDATA%\Programs\QuotaDock\versions\<版本與識別碼>\QuotaDock.exe`，目前版本由根目錄的 `current.json` 記錄，桌面捷徑直接指向使用中的版本。升級會沿用既有設定、常用指令及 Token 資料庫。
+安裝位置為 `%LOCALAPPDATA%\Programs\QuotaDock\versions\<版本與識別碼>\QuotaDock.exe`，目前版本由根目錄的 `current.json` 記錄。桌面捷徑與開機啟動使用固定的 `QuotaDockLauncher.exe`，由它開啟目前版本。升級會沿用既有設定、常用指令及 Token 資料庫。
 
 v1.4.5 的自動更新會依 GitHub 版本附件資訊核對下載大小與 SHA-256，先完成暫存才關閉舊程式。安裝後會等待新版主視窗進入事件迴圈；失敗時嘗試還原程式、桌面捷徑與開機設定，安裝目錄保留上一版 `QuotaDock.exe.bak`。這是下載完整性校驗，並非 Windows 程式碼簽章。
 
@@ -184,7 +186,9 @@ v1.4.3 為會變動的統計數值加入約半秒的滾動動畫：
 
 偵測到新版後會顯示「有新版 · 點此更新」。**由你點擊後才下載與安裝**：核對 SHA-256、寫入全新的版本目錄、結束舊程式，再等待新版主視窗就緒後切換桌面捷徑與開機啟動設定。舊 EXE 保留原位；新版啟動或設定失敗時回復原設定並重新開啟舊版，不必覆寫被占用的舊檔。既有設定、指令與 Token 資料庫沿用原位置。
 
-安裝目錄為 `%LOCALAPPDATA%\Programs\QuotaDock\versions\<版本-安裝識別碼>\QuotaDock.exe`；`current.json` 記錄目前啟用路徑。每次安裝使用新目錄，並以安裝鎖阻止同時安裝。設定中顯示「目前版本」，滑鼠停留可查看實際執行路徑。升級前已開啟的舊檔捷徑或手動保留的 portable 檔仍指向原檔，請使用更新後的桌面捷徑。
+安裝目錄為 `%LOCALAPPDATA%\Programs\QuotaDock\versions\<版本-安裝識別碼>\QuotaDock.exe`；`current.json` 記錄目前啟用路徑。每次安裝使用新目錄，並以安裝鎖阻止同時安裝。固定啟動程式不在每次更新時更換，因此釘選它的同一份捷徑可持續使用。設定中顯示目前版本，滑鼠停留可查看實際執行路徑。
+
+v1.4.11 會檢查桌面及工作列釘選資料夾，只遷移能確認指向本安裝目錄、上一執行版本或這次更新來源的捷徑，保留原名稱與其他應用程式的捷徑。若非常舊的釘選仍被 Windows 快取，或是無法確認來源的舊免安裝檔，請解除舊釘選，再將新版桌面捷徑釘選一次；之後均使用固定入口。安裝失敗時會還原已修改的捷徑及開機啟動設定。
 
 主畫面左上角「AI 用量」旁也會固定顯示目前版本號。價格快取儲存在 `%LOCALAPPDATA%\CodexUsageWidget\model_prices.json`；只包含官方價格文件、來源與同步時間，不含帳號、指令或用量。
 

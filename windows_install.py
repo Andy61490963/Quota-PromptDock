@@ -14,6 +14,8 @@ from pathlib import Path
 
 from install_handoff import HANDOFF_PATH, HANDOFF_TOKEN, ORIGIN_EXE, ORIGIN_PID, UpdateOrigin
 from updates import install_release
+from launch_entry import (LauncherInstall, autostart_entry, find_shortcuts,
+                          notify_shortcuts, rewrite_shortcut)
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 READY_PATH_ENV = "QUOTA_PROMPTDOCK_READY_FILE"
@@ -77,7 +79,8 @@ def _install_lock(root: Path):
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-def install_versioned_release(source: Path, root: Path, version: str, autostart: bool) -> Path:
+def install_versioned_release(source: Path, root: Path, version: str, autostart: bool, *,
+                              launcher_source: Path | None = None) -> Path:
     """每次使用全新目錄，舊 EXE 即使不允許刪除／替換也能升級並回復。"""
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("安裝版本格式錯誤。")
@@ -87,7 +90,7 @@ def install_versioned_release(source: Path, root: Path, version: str, autostart:
         target = (root / "versions" / f"{version}-{uuid.uuid4().hex}" / "QuotaDock.exe").resolve()
         target.relative_to(root)
         install_windows_release(source, target, autostart, previous_target=previous,
-                                activation_file=root / "current.json")
+                                activation_file=root / "current.json", launcher_source=launcher_source)
         return target
 
 
@@ -198,6 +201,8 @@ def wait_for_startup(process, ready_path: Path, token: str, timeout: float = 30.
 def set_frozen_autostart(executable: Path, enabled: bool) -> None:
     import winreg
 
+    executable = autostart_entry(executable)
+
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY,
                              0, winreg.KEY_SET_VALUE)
@@ -273,7 +278,8 @@ def _restore_run_values(values: dict[str, tuple[object, int] | None]) -> None:
 class InstallSettings:
     """記住捷徑與開機啟動原值，讓安裝失敗能還原。"""
 
-    def __init__(self, target: Path, autostart: bool, powershell) -> None:
+    def __init__(self, target: Path, autostart: bool, powershell,
+                 launcher_source: Path | None = None, previous_targets=()) -> None:
         self.target = Path(target)
         self.autostart = autostart
         self.powershell = powershell
@@ -281,6 +287,10 @@ class InstallSettings:
         self.previous_shortcut: bytes | None = None
         self.previous_run_values: dict[str, tuple[object, int] | None] | None = None
         self.prepared = False
+        self.root = self.target.parent.parent.parent if self.target.parent.parent.name == "versions" else None
+        self.entry = LauncherInstall(self.root, launcher_source) if self.root and launcher_source is not None else None
+        self.previous_targets = previous_targets
+        self.related_shortcuts: dict[Path, bytes] = {}
 
     def prepare(self) -> None:
         if self.prepared:
@@ -290,6 +300,16 @@ class InstallSettings:
             raise RuntimeError("桌面捷徑位置不是檔案，已中止安裝設定。")
         previous_shortcut = shortcut.read_bytes() if shortcut.is_file() else None
         previous_run_values = _snapshot_run_values()
+        if self.entry is not None:
+            self.entry.prepare()
+        if self.root is not None:
+            folders = [shortcut.parent]
+            if os.environ.get("APPDATA"):
+                folders.append(Path(os.environ["APPDATA"]) /
+                               "Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar")
+            self.related_shortcuts = find_shortcuts(self.powershell, folders, self.root,
+                (*self.previous_targets, self.target))
+            self.related_shortcuts.pop(shortcut, None)
         self.shortcut = shortcut
         self.previous_shortcut = previous_shortcut
         self.previous_run_values = previous_run_values
@@ -298,17 +318,14 @@ class InstallSettings:
     def apply(self) -> None:
         self.prepare()
         assert self.shortcut is not None
-        shortcut_path = base64.b64encode(str(self.shortcut).encode("utf-16-le")).decode("ascii")
-        self.powershell(
-            "$ErrorActionPreference='Stop'; $target=$env:QUOTADOCK_INSTALL_TARGET; "
-            "$folder=Split-Path -Parent $target; "
-            f"$path=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{shortcut_path}')); "
-            "$shell=New-Object -ComObject WScript.Shell; $shortcut=$shell.CreateShortcut($path); "
-            "$shortcut.TargetPath=$target; $shortcut.WorkingDirectory=$folder; "
-            "$shortcut.Description='AI 額度與常用指令小工具'; "
-            "$shortcut.IconLocation=\"$target,0\"; $shortcut.Save()"
-        )
-        set_frozen_autostart(self.target, self.autostart)
+        if self.entry is not None:
+            self.entry.apply()
+        target = self.entry.target if self.entry is not None else self.target
+        rewrite_shortcut(self.powershell, self.shortcut, target)
+        for path in self.related_shortcuts:
+            rewrite_shortcut(self.powershell, path, target)
+        set_frozen_autostart(target, self.autostart)
+        notify_shortcuts((self.shortcut, *self.related_shortcuts))
 
     def rollback(self) -> None:
         if not self.prepared:
@@ -332,10 +349,21 @@ class InstallSettings:
                         staged.unlink(missing_ok=True)
         except OSError as exc:
             failures.append(exc)
+        for path, data in self.related_shortcuts.items():
+            try:
+                _atomic_bytes(path, data)
+            except OSError as exc:
+                failures.append(exc)
         try:
             _restore_run_values(self.previous_run_values)
         except OSError as exc:
             failures.append(exc)
+        if self.entry is not None:
+            try:
+                self.entry.rollback()
+            except OSError as exc:
+                failures.append(exc)
+        notify_shortcuts((self.shortcut, *self.related_shortcuts))
         if failures:
             raise RuntimeError("安裝設定無法完整還原，請檢查桌面捷徑與開機啟動設定。") from failures[0]
         self.prepared = False
@@ -343,7 +371,8 @@ class InstallSettings:
 
 def install_windows_release(source: Path, target: Path, autostart: bool, *,
                             previous_target: Path | None = None,
-                            activation_file: Path | None = None) -> None:
+                            activation_file: Path | None = None,
+                            launcher_source: Path | None = None) -> None:
     origin = UpdateOrigin.from_environment()
     environment = os.environ.copy()
     for name in (HANDOFF_PATH, HANDOFF_TOKEN, ORIGIN_EXE, ORIGIN_PID):
@@ -393,7 +422,8 @@ def install_windows_release(source: Path, target: Path, autostart: bool, *,
             "if([DateTime]::UtcNow -gt $deadline){ throw '無法停止既有安裝' }; Start-Sleep -Milliseconds 100 } }"
         )
 
-    settings = InstallSettings(target, autostart, powershell)
+    aliases = tuple(p for p in (previous_target, source, origin.executable if origin is not None else None) if p is not None)
+    settings = InstallSettings(target, autostart, powershell, launcher_source, aliases)
     # 新版啟動時也可能更新 Run 值，須先保存舊值才能在失敗時還原。
     settings.prepare()
     previous_activation = (activation_file.read_bytes()

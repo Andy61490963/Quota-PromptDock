@@ -17,6 +17,8 @@ if ($PythonExe) {
 
 & $pythonExe (Join-Path $project 'make_icon.py')
 if ($LASTEXITCODE -ne 0) { throw '產生圖示失敗。' }
+$launcherExe = Join-Path $project 'build\launcher\QuotaDockLauncher.exe'
+& (Join-Path $project 'tools\build_launcher.ps1') -OutputPath $launcherExe
 $previousQtPlatform = $env:QT_QPA_PLATFORM
 $previousDataDir = $env:QUOTA_PROMPTDOCK_DATA_DIR
 $isolatedDataDir = Join-Path $project ("build\verification-{0}" -f [guid]::NewGuid().ToString("N"))
@@ -42,6 +44,7 @@ try {
     --windowed `
     --name 'QuotaDock' `
     --icon (Join-Path $project 'codex_usage.ico') `
+    --add-binary "$launcherExe;." `
     --distpath $release `
     --workpath (Join-Path $project 'build') `
     --specpath $project `
