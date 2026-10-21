@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 
 PRICING_DATE = "2026-10-21"
 PRICING_URL = "https://developers.openai.com/api/docs/pricing"
@@ -10,11 +11,13 @@ LONG_CONTEXT_THRESHOLD = 272_000
 
 @dataclass(frozen=True)
 class ModelPrice:
-    # 每 Token 的十億分之一美元，使用整數計算，顯示時才四捨五入。
-    input_rate: int
-    cached_rate: int
-    write_rate: int | None
-    output_rate: int
+    # 以每 Token 十億分之一美元為單位；不足整數時用 Decimal，顯示才四捨五入。
+    input_rate: int | Decimal
+    cached_rate: int | Decimal | None
+    write_rate: int | Decimal | None
+    output_rate: int | Decimal
+    threshold: int | None = LONG_CONTEXT_THRESHOLD
+    long_rates: tuple | None = None
 
 
 # 來源：官方價格頁及各模型頁（包含 gpt-6.1-sol、gpt-6-sol、gpt-6-luna、gpt-5.5）。
@@ -33,12 +36,20 @@ MODEL_PRICES = {
 }
 
 
-def estimate_response_usd(model, input_tokens, cached_tokens, write_tokens, output_tokens) -> float | None:
+def estimate_response_usd(model, input_tokens, cached_tokens, write_tokens, output_tokens, *, prices=None) -> float | None:
     """單次回應先計價再加總；未知單價或必要明細缺漏時不猜測。"""
-    price = MODEL_PRICES.get(model)
+    price = (MODEL_PRICES if prices is None else prices).get(model)
     if price is None:
         return None
-    if price.write_rate is None:
+    long = price.threshold is not None and type(input_tokens) is int and input_tokens > price.threshold
+    rates = price.long_rates if long and price.long_rates is not None else (
+        price.input_rate, price.cached_rate, price.write_rate, price.output_rate)
+    input_rate, cached_rate, write_rate, output_rate = rates
+    if input_rate is None or output_rate is None:
+        return None
+    if cached_rate is None and cached_tokens not in (None, 0):
+        return None
+    if write_rate is None:
         # 未公布快取寫入單價的舊模型，只接受未記錄寫入或明確為零。
         if write_tokens not in (None, 0):
             return None
@@ -49,13 +60,13 @@ def estimate_response_usd(model, input_tokens, cached_tokens, write_tokens, outp
     if cached_tokens + write_tokens > input_tokens:
         return None
     uncached = input_tokens - cached_tokens - write_tokens
-    input_cost = (uncached * price.input_rate + cached_tokens * price.cached_rate
-                  + write_tokens * (price.write_rate or 0))
-    output_cost = output_tokens * price.output_rate
-    if input_tokens > LONG_CONTEXT_THRESHOLD:
+    input_cost = (uncached * input_rate + cached_tokens * (cached_rate or 0)
+                  + write_tokens * (write_rate or 0))
+    output_cost = output_tokens * output_rate
+    if long and price.long_rates is None:
         input_cost *= 2
         output_cost = output_cost * 3 // 2
-    return (input_cost + output_cost) / 1_000_000_000
+    return float((input_cost + output_cost) / 1_000_000_000)
 
 
 def format_cost(usd: float, priced: int, responses: int) -> str:
@@ -67,14 +78,15 @@ def format_cost(usd: float, priced: int, responses: int) -> str:
     return amount + ("（部分）" if priced < responses else "")
 
 
-def pricing_description(usd: float, priced: int, responses: int) -> str:
+def pricing_description(usd: float, priced: int, responses: int, note="") -> str:
+    source_note = note or f"採 {PRICING_DATE} 核對的 Standard 文字 Token 美元單價，歷史用量也以此價格比較。"
     return (
         f"API 等值估算：{format_cost(usd, priced, responses)}\n"
         f"已估算 {priced:,} / {responses:,} 次回應；未涵蓋部分不視為零。\n"
-        f"採 {PRICING_DATE} 核對的 Standard 文字 Token 美元單價，歷史用量也以此價格比較。\n"
+        f"{source_note}\n"
         "逐次計算：（輸入 − 快取讀取 − 快取寫入）× 輸入單價 + 快取讀取 × 快取單價"
         " + 快取寫入 × 寫入單價 + 輸出 × 輸出單價。推理已含於輸出，不重複收費。\n"
-        "單次輸入超過 272,000 Token 時，輸入與快取費率 ×2、輸出費率 ×1.5。\n"
+        "有短／長上下文表的模型依官方門檻逐次選價；內建表以 272,000 Token 為門檻。\n"
         "未知模型、缺少必要快取明細或明細不一致的回應不計價。\n"
         "快取寫入採 30 分鐘單價；不含 12 小時快取寫入加價。\n"
         "此為 API 對照估算，非訂閱帳單；不含 Fast／Priority 加價、Batch／Flex 折扣、"

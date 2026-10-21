@@ -17,6 +17,7 @@ from token_usage import (PERIODS, TAIWAN_TZ, TokenUsageCollector, TokenUsageStor
                          UsageGroup, UsageReport)
 from odometer import OdometerLabel, OdometerItemDelegate, KEY_ROLE
 from api_pricing import estimate_response_usd, format_cost, pricing_description
+from price_sync import PriceCatalog, PriceSynchronizer
 
 SHOW_TOKEN_SETTING = "tokens/show_panel"
 TOKEN_PERIOD_SETTING = "tokens/period"
@@ -57,7 +58,7 @@ def coverage_text(report: UsageReport) -> str:
         parts.append("歷史涵蓋不完整（以下為全部已掃描來源）：\n" + "\n".join(gaps))
     parts.append("快取輸入已含於輸入；推理已含於輸出。— 代表來源未提供完整明細，不是零。")
     parts.append("用量不換算訂閱額度或實際帳單；未下載到本機的其他裝置／雲端紀錄不包含在內。")
-    parts.append(pricing_description(report.api_cost_usd, report.priced_responses, report.responses))
+    parts.append(pricing_description(report.api_cost_usd, report.priced_responses, report.responses, report.pricing_note))
     return "\n".join(parts)
 
 
@@ -67,7 +68,7 @@ class TokenUsageService(QObject):
     turns_ready = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, path: Path, period="today", root=None, parent=None):
+    def __init__(self, path: Path, period="today", root=None, parent=None, *, sync_prices=False):
         super().__init__(parent)
         self.path, self.root = path, root
         self._period = period
@@ -82,6 +83,9 @@ class TokenUsageService(QObject):
         self._last_report = None
         self._report_day = None
         self._had_failure = False
+        self._sync_prices = sync_prices
+        self._price_sync = None
+        self._price_refresh = False
 
     def start(self):
         if self._thread is None:
@@ -91,6 +95,8 @@ class TokenUsageService(QObject):
     def stop(self):
         self._stop.set()
         self._wake.set()
+        if self._price_sync:
+            self._price_sync.stop()
         if self._thread:
             self._thread.join(timeout=2)
 
@@ -98,6 +104,12 @@ class TokenUsageService(QObject):
         with self._lock:
             self._refresh = True
             self._audit_requested = self._audit_requested or audit
+            self._price_refresh = self._price_refresh or audit
+        self._wake.set()
+
+    def _prices_changed(self):
+        with self._lock:
+            self._query = True
         self._wake.set()
 
     def set_period(self, period):
@@ -132,6 +144,9 @@ class TokenUsageService(QObject):
                         replace(self._last_report, updated_at=report.updated_at) != report):
                     self._last_report = report
                     self.report_ready.emit(report)
+                if self._price_sync and any(g.model and g.model not in self._price_sync.catalog.snapshot().prices
+                                            for g in report.groups):
+                    self._price_sync.request()
             if turns:
                 request_id, period, model, effort, page = turns
                 rows, count = store.turns(period, model, effort, page)
@@ -153,11 +168,20 @@ class TokenUsageService(QObject):
             audit_requested = False
             try:
                 if store is None:
-                    store = TokenUsageStore(self.path)
+                    catalog = PriceCatalog(self.path.with_name("model_prices.json")) if self._sync_prices else None
+                    store = TokenUsageStore(self.path, catalog)
+                    if catalog is not None:
+                        self._price_sync = PriceSynchronizer(catalog, self._prices_changed)
+                        if self._stop.is_set():
+                            return
+                        self._price_sync.start()
                 collector = TokenUsageCollector(store, self.root)
                 with self._lock:
                     refresh, self._refresh = self._refresh, False
                     audit_requested, self._audit_requested = self._audit_requested, False
+                    price_refresh, self._price_refresh = self._price_refresh, False
+                if price_refresh and self._price_sync:
+                    self._price_sync.request(force=True)
                 self._publish(store)
                 now = time.monotonic()
                 if refresh or now >= next_scan:
@@ -299,6 +323,11 @@ class TokenUsagePanel(QFrame):
         self.cost.setObjectName("tokenCost")
         self.cost.setAccessibleName("API 等值費用，美元估算")
         layout.addWidget(self.cost)
+        self.price_status = ElidedLabel()
+        self.price_status.set_full_text("價格：內建價格")
+        self.price_status.setObjectName("tokenStatus")
+        self.price_status.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.price_status)
         self.rows = []
         self.row_details = []
         for _ in range(3):
@@ -372,7 +401,9 @@ class TokenUsagePanel(QFrame):
         self.total.setText(f"{compact_tokens(report.total_tokens)} Token" if report.first_at is not None else "— Token")
         self.total.setToolTip(f"{report.total_tokens:,} Token · {report.responses:,} 次回應")
         self.cost.setText("API 等值 " + format_cost(report.api_cost_usd, report.priced_responses, report.responses))
-        detail = pricing_description(report.api_cost_usd, report.priced_responses, report.responses)
+        detail = pricing_description(report.api_cost_usd, report.priced_responses, report.responses, report.pricing_note)
+        self.price_status.set_full_text("價格：" + (report.pricing_note.split("\n")[0] if report.pricing_note else "內建價格"))
+        self.price_status.setToolTip(detail)
         self.cost.setToolTip(detail)
         self.cost.setAccessibleDescription(detail)
         for index, (row, name, value) in enumerate(self.rows):
@@ -668,7 +699,7 @@ class TokenDetailsDialog(QDialog):
         for label, value in zip(self.metrics, (report.total_tokens, sum(g.input_tokens for g in report.groups), sum(g.output_tokens for g in report.groups))):
             label.setText(full_number(value))
         self.metrics[3].setText(format_cost(report.api_cost_usd, report.priced_responses, report.responses).replace("（部分）", ""))
-        self.metrics[3].setToolTip(pricing_description(report.api_cost_usd, report.priced_responses, report.responses))
+        self.metrics[3].setToolTip(pricing_description(report.api_cost_usd, report.priced_responses, report.responses, report.pricing_note))
         self.cost_hint.setText("僅部分回應可估算 · 查看說明" if report.priced_responses < report.responses else "Standard 估算 · 非實際帳單")
         self.group_heading.setText(f"模型與推理強度  ·  {len(report.groups)} 組")
         self.groups.blockSignals(True)
@@ -685,7 +716,7 @@ class TokenDetailsDialog(QDialog):
                 if column == 0:
                     item.setToolTip(group.model or "未知模型")
                 if column == 8:
-                    item.setToolTip(pricing_description(group.api_cost_usd, group.priced_responses, group.responses))
+                    item.setToolTip(pricing_description(group.api_cost_usd, group.priced_responses, group.responses, report.pricing_note))
                     item.setForeground(QColor("#85E8BE"))
                 if column == 1:
                     item.setForeground(QColor("#9BC4F5"))
@@ -797,7 +828,7 @@ class TokenDetailsDialog(QDialog):
                 item = QTableWidgetItem(text)
                 item.setToolTip(f"對話：{row['thread_id']}\n回合：{row['turn_id']}" if column == 1 else text)
                 if column == 6:
-                    item.setToolTip(pricing_description(row["api_cost_usd"], row["priced_responses"], row["responses"]))
+                    item.setToolTip(pricing_description(row["api_cost_usd"], row["priced_responses"], row["responses"], self.report.pricing_note))
                     item.setForeground(QColor("#85E8BE"))
                 if column >= 2:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)

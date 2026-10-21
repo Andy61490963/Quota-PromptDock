@@ -54,7 +54,7 @@ from quota_summary import QuotaSummaryCard, QuotaSummaryRow
 
 
 APP_NAME = "Quota PromptDock"
-APP_VERSION = "1.4.8"
+APP_VERSION = "1.4.9"
 UI_SCALE_SETTING = "ui_scale_percent"
 UI_SCALE_CHOICES = (75, 90, 100, 110, 125, 150)
 TAIWAN_TZ = timezone(timedelta(hours=8))
@@ -1296,7 +1296,7 @@ class SettingsDialog(QDialog):
         self.show_tokens = QCheckBox("顯示 Token 用量")
         self.show_tokens.setChecked(_setting_bool(settings, SHOW_TOKEN_SETTING, True))
         layout.addWidget(self.show_tokens)
-        token_hint = QLabel("隱藏後仍會在背景記錄用量。")
+        token_hint = QLabel("隱藏後仍會在背景記錄用量。模型價格每天背景同步官方網站；失敗沿用快取，按「立即更新」可重新檢查。")
         token_hint.setWordWrap(True)
         token_hint.setStyleSheet("color: #94A3B8; font-size: 12px;")
         layout.addWidget(token_hint)
@@ -1500,7 +1500,7 @@ class UsageWidget(QWidget):
                 lambda period: self.token_panel.apply_report(demo_report(period)))
         else:
             self.token_service = TokenUsageService(
-                APP_DIR / "token_usage.sqlite3", self.token_panel.period.currentData(), parent=self)
+                APP_DIR / "token_usage.sqlite3", self.token_panel.period.currentData(), parent=self, sync_prices=True)
             self.token_panel.attach_service(self.token_service)
             QApplication.instance().aboutToQuit.connect(self.token_service.stop)
             self.token_service.start()
@@ -1561,6 +1561,11 @@ class UsageWidget(QWidget):
         brand = QLabel("AI  用量")
         brand.setObjectName("brand")
         header.addWidget(brand)
+        self.version_badge = QLabel(f"v{APP_VERSION}")
+        self.version_badge.setObjectName("versionBadge")
+        self.version_badge.setToolTip(f"目前版本 v{APP_VERSION}\n{Path(sys.executable).resolve()}")
+        self.version_badge.setAccessibleName(f"目前版本 v{APP_VERSION}")
+        header.addWidget(self.version_badge)
         header.addStretch()
 
         self.pin_button = QPushButton()
@@ -1793,6 +1798,7 @@ class UsageWidget(QWidget):
         """縮小額度摘要，常用指令與底部操作保持可見；兩區不互相巢狀捲動。"""
         if self._adjusting_height:
             return
+        self.token_panel.price_status.setVisible(self._height_limit >= 530)
         self.token_panel.set_row_limit(3 if self._height_limit >= 850 else 1 if self._height_limit >= 680 else 0)
         token_height = self.token_panel.sizeHint().height() + 8 if not self.token_panel.isHidden() else 0
         if self.token_panel.isHidden():
@@ -2957,6 +2963,7 @@ QPushButton:disabled { background: #26344A; color: #94A3B8; }
 #updateButton:hover { background: #274BA8; color: #FFFFFF; }
 #updateButton:pressed { background: #172E6E; }
 #updateButton:disabled { background: #1B2436; color: #94A3B8; border-color: #26344A; }
+#versionBadge { color: #A8BBCF; background: #152234; border: 1px solid #263B51; border-radius: 6px; padding: 3px 6px; font-size: 11px; font-weight: 600; }
 #textButton { min-width: 62px; min-height: 30px; padding: 0 9px; background: transparent; color: #94A3B8; font-size: 12px; border: 1px solid #26344A; border-radius: 9px; }
 #textButton:checked { color: #35E28A; border-color: #2E8B61; background: #10271E; }
 #windowButton { min-width: 32px; max-width: 32px; min-height: 30px; padding: 0; background: transparent; color: #94A3B8; font-size: 18px; }

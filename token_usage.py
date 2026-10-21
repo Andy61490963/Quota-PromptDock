@@ -13,6 +13,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
@@ -124,6 +125,7 @@ class UsageReport:
     issues: dict[str, int]
     sources: int
     updated_at: float
+    pricing_note: str = ""
 
     @property
     def api_cost_usd(self) -> float:
@@ -135,7 +137,8 @@ class UsageReport:
 
 
 class TokenUsageStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, pricing=None):
+        self.pricing = pricing
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as db:
@@ -172,10 +175,12 @@ class TokenUsageStore:
             """)
 
     @contextmanager
-    def connection(self):
+    def connection(self, price_view=None):
         db = sqlite3.connect(self.path, timeout=3)
         db.row_factory = sqlite3.Row
-        db.create_function("api_cost", 5, estimate_response_usd, deterministic=True)
+        view = price_view or (self.pricing.snapshot() if self.pricing is not None else None)
+        estimator = partial(estimate_response_usd, prices=view.prices) if view else estimate_response_usd
+        db.create_function("api_cost", 5, estimator, deterministic=True)
         try:
             yield db
         finally:
@@ -219,7 +224,8 @@ class TokenUsageStore:
 
     def report(self, period="today", now: datetime | None = None) -> UsageReport:
         start, end = period_bounds(period, now)
-        with self.connection() as db:
+        view = self.pricing.snapshot() if self.pricing is not None else None
+        with self.connection(view) as db:
             groups = tuple(UsageGroup(**dict(row)) for row in db.execute("""
                 SELECT CASE WHEN c.ambiguous=1 THEN '' ELSE COALESCE(c.model,'') END model,
                        CASE WHEN c.ambiguous=1 THEN '' ELSE COALESCE(c.effort,'') END effort,
@@ -251,7 +257,8 @@ class TokenUsageStore:
                 COALESCE(SUM(invalid_usage),0),COALESCE(SUM(error!=''),0) FROM sources""").fetchone()
             issues.update(bad_lines=bad, invalid_usage=invalid, read_errors=errors)
         return UsageReport(period, groups, sum(g.total_tokens for g in groups), sum(g.responses for g in groups),
-                           first, last, issues, sources, datetime.now(timezone.utc).timestamp())
+                           first, last, issues, sources, datetime.now(timezone.utc).timestamp(),
+                           view.note if view else "")
 
     def turns(self, period: str, model: str, effort: str, page=0, page_size=100, now=None) -> tuple[list[dict], int]:
         start, end = period_bounds(period, now)

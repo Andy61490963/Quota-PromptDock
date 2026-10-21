@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import windows_install as installer
 from install_handoff import HANDOFF_PATH, HANDOFF_TOKEN, ORIGIN_EXE, ORIGIN_PID
 from test_install_file_access import NoDeleteShare
+from tools.check_release_version import app_version
 
 
 def digest(path: Path) -> str:
@@ -115,7 +116,7 @@ def verify_case(old_exe: Path, new_exe: Path, *, rollback: bool) -> None:
             holder = NoDeleteShare(target)
 
             def install():
-                return installer.install_versioned_release(new_exe, target.parent, "1.4.8", False)
+                return installer.install_versioned_release(new_exe, target.parent, app_version(), False)
 
             with patch.dict(os.environ, environment, clear=True), \
                     patch.object(installer, "InstallSettings", IsolatedSettings), \
