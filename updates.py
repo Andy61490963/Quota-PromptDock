@@ -222,6 +222,7 @@ def install_release(
     *,
     recover: Callable[[], None] | None = None,
     rollback_settings: Callable[[], None] | None = None,
+    preserve_failed_target: bool = False,
 ) -> None:
     """先完成暫存與校驗才停止舊版；替換後失敗可還原上一份執行檔。"""
     source, target = Path(source), Path(target)
@@ -271,7 +272,7 @@ def install_release(
                     raise stop_error
                 if existed:
                     _replace_install_file(backup, target)
-                else:
+                elif not preserve_failed_target:
                     target.unlink(missing_ok=True)
             except Exception as restore_error:
                 message = (f"更新未完成，無法自動還原；上一版備份位於 {backup}。"

@@ -1,5 +1,6 @@
 """更新程序無法啟動時，主程式仍可使用且會顯示可重試狀態。"""
 from argparse import Namespace
+import json
 from pathlib import Path
 import subprocess
 
@@ -76,10 +77,27 @@ def test_frozen_install_failure_exposes_saved_diagnostic(widget, tmp_path, monke
             raise subprocess.CalledProcessError(1, ["powershell.exe"], stderr=b"NoProcessFoundForGivenId")
         except subprocess.CalledProcessError as cause:
             raise RuntimeError("安裝失敗。\n失敗步驟：等待舊版結束") from cause
-    monkeypatch.setattr(app, "install_windows_release", fail)
+    monkeypatch.setattr(app, "install_versioned_release", fail)
     with pytest.raises(RuntimeError, match="安裝紀錄：") as result:
         app.install_frozen_release()
     path = tmp_path / "install.log"
     assert str(path) in str(result.value)
     assert "NoProcessFoundForGivenId" in path.read_text(encoding="utf-8")
     assert cleaned == [Path(app.sys.executable).resolve()]
+
+
+def test_install_flag_on_active_version_does_not_stop_its_own_installer(widget, tmp_path, monkeypatch):
+    local = tmp_path / "local"
+    root = local / "Programs" / "QuotaDock"
+    current = root / "versions" / "1.4.8-test" / "QuotaDock.exe"
+    current.parent.mkdir(parents=True)
+    current.write_bytes(b"active")
+    (root / "current.json").write_text(json.dumps({"executable": str(current.relative_to(root))}))
+    monkeypatch.setattr(app.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(app.sys, "executable", str(current))
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setattr(app, "QSettings", lambda *args: widget.settings)
+    installs = []
+    monkeypatch.setattr(app, "install_versioned_release", lambda *args: installs.append(args))
+    assert app.install_frozen_release() is False
+    assert not installs and current.read_bytes() == b"active"

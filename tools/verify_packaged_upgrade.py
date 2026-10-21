@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import windows_install as installer
 from install_handoff import HANDOFF_PATH, HANDOFF_TOKEN, ORIGIN_EXE, ORIGIN_PID
+from test_install_file_access import NoDeleteShare
 
 
 def digest(path: Path) -> str:
@@ -66,6 +67,7 @@ def verify_case(old_exe: Path, new_exe: Path, *, rollback: bool) -> None:
         real_popen = subprocess.Popen
         processes = []
         launches = []
+        holder = None
         initial_ready = workspace / "舊版啟動訊號"
         initial_token = uuid.uuid4().hex
 
@@ -88,14 +90,15 @@ def verify_case(old_exe: Path, new_exe: Path, *, rollback: bool) -> None:
 
         def demo_popen(args, **kwargs):
             # subprocess.run 的 PowerShell 子程序仍使用原本參數。
-            if Path(args[0]).resolve() == target:
+            executable = Path(args[0]).resolve()
+            if executable.is_relative_to(target.parent) and executable.name == "QuotaDock.exe":
                 args = [*args, "--demo"]
                 launch_environment = kwargs["env"].copy()
                 if installer.READY_PATH_ENV not in launch_environment:
                     launch_environment[installer.READY_PATH_ENV] = str(workspace / "回復啟動訊號")
                     launch_environment[installer.READY_TOKEN_ENV] = uuid.uuid4().hex
                 kwargs["env"] = launch_environment
-                launched_hash = digest(target)
+                launched_hash = digest(executable)
                 process = real_popen(args, **kwargs)
                 processes.append(process)
                 launches.append((process, launched_hash, launch_environment))
@@ -109,25 +112,31 @@ def verify_case(old_exe: Path, new_exe: Path, *, rollback: bool) -> None:
                                  creationflags=subprocess.CREATE_NO_WINDOW)
             processes.append(initial)
             installer.wait_for_startup(initial, initial_ready, initial_token, timeout=60)
+            holder = NoDeleteShare(target)
+
+            def install():
+                return installer.install_versioned_release(new_exe, target.parent, "1.4.8", False)
+
             with patch.dict(os.environ, environment, clear=True), \
                     patch.object(installer, "InstallSettings", IsolatedSettings), \
                     patch.object(subprocess, "Popen", demo_popen):
                 if rollback:
                     try:
-                        installer.install_windows_release(new_exe, target, False)
+                        install()
                     except RuntimeError as exc:
                         if "隔離測試：模擬安裝設定失敗" not in str(exc):
                             raise
                     else:
                         raise AssertionError("設定失敗卻未回報安裝錯誤")
                 else:
-                    installer.install_windows_release(new_exe, target, False)
+                    installed = install()
 
             assert initial.poll() is not None, "原本執行中的舊版未結束"
             assert launches and launches[0][1] == new_hash, "沒有啟動真正的新版執行檔"
             assert sentinel.read_bytes() == sentinel_before, "既有資料遭到變更"
             if rollback:
                 assert digest(target) == old_hash, "回復後的執行檔不是舊版"
+                assert installer.active_install_target(target.parent) == target
                 assert settings_marker.read_bytes() == b"old-settings", "安裝設定未回復"
                 assert len(launches) >= 2 and launches[-1][1] == old_hash, "沒有重新開啟舊版"
                 recovered, _, recovered_environment = launches[-1]
@@ -136,13 +145,17 @@ def verify_case(old_exe: Path, new_exe: Path, *, rollback: bool) -> None:
                 assert launches[0][0].poll() is not None, "失敗的新版仍在執行"
                 print("通過：新版啟動後設定失敗，已還原舊 EXE、重開舊版並保留資料。", flush=True)
             else:
-                assert digest(target) == new_hash, "安裝結果不符合新版 SHA-256"
-                assert digest(target.with_name(target.name + ".bak")) == old_hash, "備份不符合舊版 SHA-256"
+                assert digest(installed) == new_hash, "安裝結果不符合新版 SHA-256"
+                assert digest(target) == old_hash, "原版檔案遭到修改"
+                assert installer.active_install_target(target.parent) == installed
                 assert settings_marker.read_bytes() == b"new-settings", "安裝設定未完成"
                 assert launches[-1][0].poll() is None, "新版啟動後異常結束"
-                print("通過：停止真正的舊 EXE、校驗並替換新版、收到新版 READY，備份與資料正確。", flush=True)
+                print("通過：停止真正的舊 EXE、安裝新版目錄並收到 READY，原檔與資料保持完整。", flush=True)
         finally:
-            stop_test_processes(target, workspace)
+            if holder is not None:
+                holder.close()
+            for executable in target.parent.rglob("QuotaDock.exe"):
+                stop_test_processes(executable, workspace)
             for process in processes:
                 process.wait(timeout=10)
 
@@ -159,9 +172,10 @@ def main() -> None:
         raise SystemExit("缺少新舊執行檔，發布驗證不可略過。")
     if digest(old_exe) == digest(new_exe):
         raise SystemExit("新舊執行檔完全相同，無法驗證跨版本升級。")
-    print("真實驗證：新舊 PyInstaller EXE、Windows CIM 停止程序、安裝服務、檔案替換與 READY。", flush=True)
+    print("真實驗證：新舊 PyInstaller EXE、Windows CIM 停止程序、版本目錄與 READY。", flush=True)
     print("隔離替身：展示資料、無視窗 Qt、暫存資料目錄；捷徑與 HKCU 設定以暫存標記檔代替。", flush=True)
     print("範圍限制：不操作真實帳號、既有 App、桌面捷徑或開機啟動設定；未驗證單例及 UI 點擊更新。", flush=True)
+    print("版本目錄驗證：舊 EXE 持續被 Windows 原生句柄鎖定，仍須升級或回復。", flush=True)
     verify_case(old_exe, new_exe, rollback=False)
     verify_case(old_exe, new_exe, rollback=True)
 

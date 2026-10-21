@@ -157,6 +157,7 @@ class TokenUsageStore:
                     total_tokens INTEGER NOT NULL, conflict INTEGER NOT NULL DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS responses_time ON responses(occurred_at);
                 CREATE INDEX IF NOT EXISTS responses_turn ON responses(thread_id, turn_id);
+                CREATE INDEX IF NOT EXISTS responses_turn_id ON responses(turn_id);
                 CREATE TABLE IF NOT EXISTS sources (
                     path TEXT PRIMARY KEY, identity TEXT NOT NULL DEFAULT '',
                     offset INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0,

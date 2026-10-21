@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -18,6 +21,74 @@ READY_TOKEN_ENV = "QUOTA_PROMPTDOCK_READY_TOKEN"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAMES = ("QuotaDock", "CodexUsageWidget")
 STARTUP_TIMEOUT_SECONDS = 30.0
+
+
+def _atomic_bytes(path: Path, data: bytes) -> None:
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".quota-active-", delete=False) as handle:
+            staged = Path(handle.name)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staged, path)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
+
+def active_install_target(root: Path) -> Path:
+    """只接受安裝根目錄內的版本路徑；舊版沒有指標時沿用固定位置。"""
+    root = root.resolve()
+    manifest = root / "current.json"
+    if not manifest.exists():
+        return root / "QuotaDock.exe"
+    try:
+        record = json.loads(manifest.read_text(encoding="utf-8"))
+        relative = Path(record["executable"])
+        target = (root / relative).resolve()
+        target.relative_to(root / "versions")
+        if relative.is_absolute() or target.name != "QuotaDock.exe" or not target.is_file():
+            raise ValueError("invalid active executable")
+        return target
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError("目前安裝的版本指標無效，已保留原程式；請提供 current.json 協助排查。") from exc
+
+
+@contextmanager
+def _install_lock(root: Path):
+    import msvcrt
+
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".install.lock").open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise RuntimeError("另一個更新安裝仍在執行，請等待完成後再重試。") from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def install_versioned_release(source: Path, root: Path, version: str, autostart: bool) -> Path:
+    """每次使用全新目錄，舊 EXE 即使不允許刪除／替換也能升級並回復。"""
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise ValueError("安裝版本格式錯誤。")
+    root = root.resolve()
+    with _install_lock(root):
+        previous = active_install_target(root)
+        target = (root / "versions" / f"{version}-{uuid.uuid4().hex}" / "QuotaDock.exe").resolve()
+        target.relative_to(root)
+        install_windows_release(source, target, autostart, previous_target=previous,
+                                activation_file=root / "current.json")
+        return target
 
 
 _PROCESS_PATH_LOOKUP_SCRIPT = r"""
@@ -270,12 +341,15 @@ class InstallSettings:
         self.prepared = False
 
 
-def install_windows_release(source: Path, target: Path, autostart: bool) -> None:
+def install_windows_release(source: Path, target: Path, autostart: bool, *,
+                            previous_target: Path | None = None,
+                            activation_file: Path | None = None) -> None:
     origin = UpdateOrigin.from_environment()
     environment = os.environ.copy()
     for name in (HANDOFF_PATH, HANDOFF_TOKEN, ORIGIN_EXE, ORIGIN_PID):
         environment.pop(name, None)
     environment["QUOTADOCK_INSTALL_TARGET"] = str(target.resolve())
+    environment["QUOTADOCK_PREVIOUS_TARGET"] = str(previous_target.resolve()) if previous_target else ""
     environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
 
     def powershell(script: str):
@@ -291,7 +365,10 @@ def install_windows_release(source: Path, target: Path, autostart: bool) -> None
             origin.stop()
         powershell(_PROCESS_PATH_LOOKUP_SCRIPT +
             "$ErrorActionPreference='Stop'; "
-            "$target=[IO.Path]::GetFullPath($env:QUOTADOCK_INSTALL_TARGET); "
+            "$targets=@($env:QUOTADOCK_INSTALL_TARGET); "
+            "if($env:QUOTADOCK_PREVIOUS_TARGET){ $targets+= $env:QUOTADOCK_PREVIOUS_TARGET }; "
+            "foreach($target in ($targets | Select-Object -Unique)){ "
+            "$target=[IO.Path]::GetFullPath($target); "
             "$running=@(Get-QuotaRunning $target); "
             "foreach($item in $running){ $targetPid=$item.ProcessId; "
             "$p=Get-Process -Id $targetPid -ErrorAction SilentlyContinue; "
@@ -313,24 +390,36 @@ def install_windows_release(source: Path, target: Path, autostart: bool) -> None
             "} }; "
             "$deadline=[DateTime]::UtcNow.AddSeconds(5); "
             "while(@(Get-QuotaRunning $target).Count){ "
-            "if([DateTime]::UtcNow -gt $deadline){ throw '無法停止既有安裝' }; Start-Sleep -Milliseconds 100 }"
+            "if([DateTime]::UtcNow -gt $deadline){ throw '無法停止既有安裝' }; Start-Sleep -Milliseconds 100 } }"
         )
 
     settings = InstallSettings(target, autostart, powershell)
     # 新版啟動時也可能更新 Run 值，須先保存舊值才能在失敗時還原。
     settings.prepare()
+    previous_activation = (activation_file.read_bytes()
+                           if activation_file is not None and activation_file.exists() else None)
 
     def finish_install() -> None:
         settings.apply()
+        if activation_file is not None:
+            record = {"executable": str(target.resolve().relative_to(activation_file.parent.resolve()))}
+            _atomic_bytes(activation_file, json.dumps(record).encode("utf-8"))
 
     def rollback_settings() -> None:
-        settings.rollback()
+        try:
+            settings.rollback()
+        finally:
+            if activation_file is not None:
+                if previous_activation is None:
+                    activation_file.unlink(missing_ok=True)
+                else:
+                    _atomic_bytes(activation_file, previous_activation)
 
     def recover() -> None:
         if origin is not None and not origin.handed_off:
             # 原視窗仍在執行，不能多開另一份舊版。
             return
-        previous = origin.executable if origin is not None else target
+        previous = origin.executable if origin is not None else (previous_target or target)
         if not previous.is_file():
             return
         subprocess.Popen([str(previous)], cwd=str(previous.parent), env=environment,
@@ -376,5 +465,6 @@ def install_windows_release(source: Path, target: Path, autostart: bool) -> None
         finally:
             ready_path.unlink(missing_ok=True)
 
+    options = {"preserve_failed_target": True} if activation_file is not None else {}
     install_release(source, target, stop_running, finish_install, launch,
-                    recover=recover, rollback_settings=rollback_settings)
+                    recover=recover, rollback_settings=rollback_settings, **options)

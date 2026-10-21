@@ -2,9 +2,11 @@
 
 Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude Code 剩餘額度、依模型與推理強度追蹤 Codex 本機 Token 用量，並將常用指令一鍵貼到目前使用的 AI 工具。
 
-**目前正式版：v1.4.6** · Windows x64 · 繁體中文 · 不需安裝 Python
+**目前正式版：v1.4.8** · Windows x64 · 繁體中文 · 不需安裝 Python
 
-[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.7 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.7) · [驗證紀錄](驗證紀錄.md)
+[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.8 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.8) · [驗證紀錄](驗證紀錄.md)
+
+**v1.4.8**：改用版本目錄安裝，舊執行檔遭占用時也能更新；加速 Token 統計查詢、補入 GPT-6.1 Sol Standard API 估價，設定中可查看目前版本。詳見[版本說明](docs/發布說明-v1.4.8.md)。
 
 **v1.4.5 更新重點**：首次使用引導、懸浮額度摘要、指令搜尋與預覽，以及 GPT-6 Sol／Luna 估價、更新校驗與回復、通知和背景效能修正。完整變更見[版本說明](docs/發布說明-v1.4.5.md)，測試方式見[驗證紀錄](驗證紀錄.md)。
 
@@ -116,7 +118,7 @@ Token 小卡與明細視窗顯示 **API 等值美元估算**，模型列、各�
 
 <img src="docs/api-cost-preview.png" width="340" alt="v1.4.4 API 等值美元估算；數字為示範資料">
 
-- 價格表於 **2026-09-29** 補入 [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol) 與 [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) 的 Standard 單價，並涵蓋既有 GPT-6 Astra、GPT-5.6 Sol／Terra／Luna 與 [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5)。歷史用量統一以此價格比較；更新內建價格表需更新程式。
+- 價格表於 **2026-10-21** 補入 [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol) 的 Standard 單價，並涵蓋既有 GPT-6 Astra／Sol／Luna、GPT-5.6 Sol／Terra／Luna 與 [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5)。Token 模型清單會由紀錄自動收錄；美元價格表需更新程式，不會自動同步新模型單價。
 - 每次回應分別計算一般輸入、快取讀取、快取寫入及輸出費用，之後才按模型、回合及日期加總。快取從一般輸入扣除；推理已含在輸出，不再次計費。
 - 單次輸入超過 272,000 Token 時，輸入與快取費率乘 2、輸出費率乘 1.5；不以整日或整回合的累計 Token 判斷。
 - 模型單價未知、必要快取明細缺漏或明細不一致時不猜價。部分回應可估算時標示「部分」，全部不可估算顯示「無法估算」，無回應顯示 `—`；小於一美分但大於零時顯示 `< US$0.01`。
@@ -173,7 +175,9 @@ v1.4.3 為會變動的統計數值加入約半秒的滾動動畫：
 
 版本檢查讀取本專案的 [最新正式 Release](https://github.com/Andy61490963/Quota-PromptDock/releases/latest)，版本號必須比目前版本高，且附有名稱完全相同的 `QuotaDock-Windows-x64.exe`。草稿、預發行及只有程式碼變動的版本不會提示更新。
 
-偵測到新版後會顯示「有新版 · 點此更新」。**由你點擊後才下載與安裝**：下載至暫存目錄、結束舊程式、替換安裝位置的執行檔，再重新開啟。既有設定、指令與 Token 資料庫沿用原位置。
+偵測到新版後會顯示「有新版 · 點此更新」。**由你點擊後才下載與安裝**：核對 SHA-256、寫入全新的版本目錄、結束舊程式，再等待新版主視窗就緒後切換桌面捷徑與開機啟動設定。舊 EXE 保留原位；新版啟動或設定失敗時回復原設定並重新開啟舊版，不必覆寫被占用的舊檔。既有設定、指令與 Token 資料庫沿用原位置。
+
+安裝目錄為 `%LOCALAPPDATA%\Programs\QuotaDock\versions\<版本-安裝識別碼>\QuotaDock.exe`；`current.json` 記錄目前啟用路徑。每次安裝使用新目錄，並以安裝鎖阻止同時安裝。設定中顯示「目前版本」，滑鼠停留可查看實際執行路徑。升級前已開啟的舊檔捷徑或手動保留的 portable 檔仍指向原檔，請使用更新後的桌面捷徑。
 
 **主畫面的「立即更新」更新的是額度與 Token 資料，不是檢查 App 新版。**
 

@@ -47,14 +47,14 @@ from prompt_tools import PasteController, PromptPanel, PromptStore
 from token_panel import SHOW_TOKEN_SETTING, TokenUsagePanel, TokenUsageService, demo_report
 from odometer import DigitRoller, OdometerLabel
 from updates import UpdateChecker, parse_release, record_install_failure, GITHUB_REPO, RELEASE_API, RELEASE_DOWNLOAD_PREFIX, RELEASE_ASSET
-from windows_install import install_windows_release, signal_startup_ready, set_frozen_autostart as _set_frozen_autostart
+from windows_install import active_install_target, install_versioned_release, signal_startup_ready, set_frozen_autostart as _set_frozen_autostart
 from install_handoff import handoff_environment, wait_for_handoff, schedule_download_cleanup, discard_download
 from onboarding import OnboardingDialog
 from quota_summary import QuotaSummaryCard, QuotaSummaryRow
 
 
 APP_NAME = "Quota PromptDock"
-APP_VERSION = "1.4.7"
+APP_VERSION = "1.4.8"
 UI_SCALE_SETTING = "ui_scale_percent"
 UI_SCALE_CHOICES = (75, 90, 100, 110, 125, 150)
 TAIWAN_TZ = timezone(timedelta(hours=8))
@@ -1276,6 +1276,10 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(12)
+
+        self.version_label = QLabel(f"目前版本 v{APP_VERSION}")
+        self.version_label.setToolTip(str(Path(sys.executable).resolve()))
+        layout.addWidget(self.version_label)
 
         layout.addWidget(QLabel("介面縮放"))
         self.ui_scale = SettingsComboBox()
@@ -2850,12 +2854,12 @@ def install_frozen_release() -> bool:
     if os.name != "nt" or not getattr(sys, "frozen", False):
         return False
     current = Path(sys.executable).resolve()
-    target = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "QuotaDock" / "QuotaDock.exe"
-    if str(current).casefold() == str(target.resolve()).casefold():
-        return False
+    root = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "QuotaDock"
     autostart = _setting_bool(QSettings("EricTools", "CodexUsageWidget"), "autostart", False)
     try:
-        install_windows_release(current, target, autostart)
+        if current == active_install_target(root):
+            return False
+        install_versioned_release(current, root, APP_VERSION, autostart)
     except Exception as exc:
         log_path = record_install_failure(exc, APP_DIR, APP_VERSION)
         if log_path is not None:

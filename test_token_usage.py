@@ -56,6 +56,26 @@ def scan(collector, **kwargs):
     return list(collector.scan(**kwargs))
 
 
+def test_existing_ledger_adds_turn_lookup_for_legacy_coverage(ledger):
+    store, collector, path = ledger
+    write(path, [meta(), context(), response(),
+                 event("event_msg", {"type": "token_count", "info": {}})])
+    scan(collector)
+    before = report(store)
+    with store.connection() as db:
+        # Simulate a version-1 database created before this index was added.
+        db.execute("DROP INDEX IF EXISTS responses_turn_id")
+    upgraded = tu.TokenUsageStore(store.path)
+    after = report(upgraded)
+    assert after.groups == before.groups and after.issues == before.issues
+    with upgraded.connection() as db:
+        plan = db.execute("""EXPLAIN QUERY PLAN
+            SELECT COUNT(*) FROM legacy_turns l WHERE NOT EXISTS
+            (SELECT 1 FROM responses r WHERE r.turn_id=l.turn_id)""").fetchall()
+    # A full response scan for each legacy turn makes coverage quadratic.
+    assert any("SEARCH r" in row[3] and "turn_id=?" in row[3] for row in plan)
+
+
 def test_model_effort_switches_versions_future_models_and_multiple_responses(ledger):
     store, collector, path = ledger
     combos = [("gpt-5.6-luna", "low"), ("gpt-5.6-luna", "high"),

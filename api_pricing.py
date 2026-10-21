@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-PRICING_DATE = "2026-09-29"
+PRICING_DATE = "2026-10-21"
 PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 LONG_CONTEXT_THRESHOLD = 272_000
 
@@ -17,9 +17,10 @@ class ModelPrice:
     output_rate: int
 
 
-# 來源：官方價格頁及各模型頁（包含 gpt-6-sol、gpt-6-luna、gpt-5.5）。
+# 來源：官方價格頁及各模型頁（包含 gpt-6.1-sol、gpt-6-sol、gpt-6-luna、gpt-5.5）。
 # 僅接受已核對的模型識別碼，未確認的模型不可套用其他模型的價格。
 MODEL_PRICES = {
+    "gpt-6.1-sol": ModelPrice(2_000, 100, 2_500, 10_000),
     "gpt-6-astra": ModelPrice(10_000, 1_000, 12_500, 50_000),
     "gpt-6-sol": ModelPrice(2_000, 200, 2_500, 10_000),
     "gpt-6-luna": ModelPrice(100, 10, 125, 500),
@@ -75,6 +76,7 @@ def pricing_description(usd: float, priced: int, responses: int) -> str:
         " + 快取寫入 × 寫入單價 + 輸出 × 輸出單價。推理已含於輸出，不重複收費。\n"
         "單次輸入超過 272,000 Token 時，輸入與快取費率 ×2、輸出費率 ×1.5。\n"
         "未知模型、缺少必要快取明細或明細不一致的回應不計價。\n"
+        "快取寫入採 30 分鐘單價；不含 12 小時快取寫入加價。\n"
         "此為 API 對照估算，非訂閱帳單；不含 Fast／Priority 加價、Batch／Flex 折扣、"
         "地區加價、工具費、稅金及未收錄的用量。\n"
         f"官方價格：{PRICING_URL}"

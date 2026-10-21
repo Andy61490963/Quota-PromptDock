@@ -6,7 +6,7 @@ from test_token_usage import NOW, context, ledger, meta, report, response, scan,
 
 
 @pytest.mark.parametrize("model,expected", [
-    ("gpt-6-astra", 1.49), ("gpt-6-sol", .298), ("gpt-6-luna", .0149),
+    ("gpt-6-astra", 1.49), ("gpt-6.1-sol", .294), ("gpt-6-sol", .298), ("gpt-6-luna", .0149),
     ("gpt-5.6-sol", .596),
     ("gpt-5.6", .596), ("gpt-5.6-terra", .33), ("gpt-5.6-luna", .033),
 ])
@@ -17,6 +17,7 @@ def test_cached_read_write_and_output_are_billed_once(model, expected):
 
 @pytest.mark.parametrize("model,input_cost,cached_cost,write_cost,output_cost", [
     ("gpt-6-sol", .2, .02, .25, 1.0),
+    ("gpt-6.1-sol", .2, .01, .25, 1.0),
     ("gpt-6-luna", .01, .001, .0125, .05),
 ])
 def test_new_models_use_each_official_standard_rate(
@@ -31,6 +32,7 @@ def test_new_models_use_each_official_standard_rate(
 
 @pytest.mark.parametrize("model,at_threshold,above_threshold", [
     ("gpt-6-sol", .294, .538004),
+    ("gpt-6.1-sol", .274, .498004),
     ("gpt-6-luna", .0147, .0269002),
 ])
 def test_new_model_long_context_boundary(model, at_threshold, above_threshold):
