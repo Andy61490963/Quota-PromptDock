@@ -145,6 +145,7 @@ def test_shortcut_and_run_values_return_to_previous_state(tmp_path, monkeypatch)
     monkeypatch.setattr(wi, "_snapshot_run_values", lambda: old_run)
     monkeypatch.setattr(wi, "_restore_run_values", restored.append)
     monkeypatch.setattr(wi, "set_frozen_autostart", lambda target, enabled: None)
+    monkeypatch.setattr(wi, "rewrite_shortcut", lambda *args: shortcut.write_bytes(b"new-shortcut"))
     settings = wi.InstallSettings(tmp_path / "QuotaDock.exe", True,
                                   lambda script: shortcut.write_bytes(b"new-shortcut"))
     settings.apply()

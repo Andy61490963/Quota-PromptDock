@@ -1,7 +1,6 @@
 """A permanent launcher and narrowly scoped migration of existing Windows links."""
 from __future__ import annotations
 
-import base64
 import ctypes
 import hashlib
 import json
@@ -10,6 +9,8 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+
+from windows_shortcuts import read_shortcut, write_shortcut
 
 LAUNCHER_NAME = "QuotaDockLauncher.exe"
 LAUNCHER_PROTOCOL = 1
@@ -99,10 +100,6 @@ class LauncherInstall:
             self.changed = False
 
 
-def _encoded(value) -> str:
-    return base64.b64encode(json.dumps(value, ensure_ascii=False).encode("utf-16-le")).decode("ascii")
-
-
 def owned_shortcut_target(value: str, root: Path, aliases) -> bool:
     if not value:
         return False
@@ -121,40 +118,22 @@ def find_shortcuts(powershell, folders, root, aliases) -> dict[Path, bytes]:
     folders = [p.resolve() for p in folders if p.is_dir() and not p.is_symlink()]
     if not folders:
         return {}
-    encoded = _encoded([str(p) for p in folders])
-    result = powershell(
-        "$ErrorActionPreference='Stop'; "
-        f"$folders=ConvertFrom-Json ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded}'))); "
-        "$shell=New-Object -ComObject WScript.Shell; $links=@(foreach($folder in $folders){ "
-        "foreach($file in (Get-ChildItem -LiteralPath $folder -File -Filter '*.lnk')){ "
-        "try { $link=$shell.CreateShortcut($file.FullName); "
-        "[pscustomobject]@{path=$file.FullName; target=$link.TargetPath; arguments=$link.Arguments} "
-        "} catch { continue } } }); ConvertTo-Json -InputObject $links -Compress"
-    )
-    records = json.loads(result.stdout.decode("utf-8-sig"))
-    if not isinstance(records, list):
-        raise RuntimeError("無法確認既有捷徑，已中止更新。")
     related = {}
-    for record in records:
-        path = Path(record["path"])
-        if (path.parent.resolve() not in folders or path.is_symlink() or path.suffix.lower() != ".lnk"
-                or "--demo" in record.get("arguments", "") or "--screenshot" in record.get("arguments", "")):
-            continue
-        if owned_shortcut_target(record["target"], root, aliases):
-            related[path] = path.read_bytes()
+    for folder in folders:
+        for path in folder.glob("*.lnk"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                target, arguments = read_shortcut(path)
+            except OSError:
+                continue
+            if "--demo" not in arguments and "--screenshot" not in arguments and owned_shortcut_target(target, root, aliases):
+                related[path] = path.read_bytes()
     return related
 
 
 def rewrite_shortcut(powershell, path: Path, target: Path):
-    encoded = _encoded({"path": str(path), "target": str(target)})
-    powershell(
-        "$ErrorActionPreference='Stop'; "
-        f"$item=ConvertFrom-Json ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded}'))); "
-        "$shell=New-Object -ComObject WScript.Shell; $link=$shell.CreateShortcut($item.path); "
-        "$link.TargetPath=$item.target; "
-        "$link.WorkingDirectory=Split-Path -Parent $item.target; "
-        "$link.Description='AI 額度與常用指令小工具'; $link.IconLocation=$item.target+',0'; $link.Save()"
-    )
+    write_shortcut(path, target)
 
 
 def notify_shortcuts(paths):

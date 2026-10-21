@@ -11,6 +11,7 @@ import pytest
 import windows_install as wi
 import launch_entry as le
 from test_install_file_access import NoDeleteShare
+from windows_shortcuts import read_shortcut, write_shortcut
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows shell shortcuts")
 
@@ -24,16 +25,9 @@ def powershell(script, *, environment=None):
 
 
 def shortcut(path, target=None, arguments=None):
-    env = os.environ | {"QUOTA_TEST_LINK": str(path)}
-    script = "$shell=New-Object -ComObject WScript.Shell; $link=$shell.CreateShortcut($env:QUOTA_TEST_LINK); "
     if target is not None:
-        env["QUOTA_TEST_EXE"] = str(target)
-        script += "$link.TargetPath=$env:QUOTA_TEST_EXE; $link.Save(); "
-    if arguments is not None:
-        env["QUOTA_TEST_ARGUMENTS"] = arguments
-        script += "$link.Arguments=$env:QUOTA_TEST_ARGUMENTS; $link.Save(); "
-    script += "Write-Output $link.TargetPath"
-    return Path(powershell(script, environment=env).stdout.decode("utf-8").strip())
+        write_shortcut(path, target, arguments=arguments)
+    return Path(read_shortcut(path)[0])
 
 
 @pytest.fixture
