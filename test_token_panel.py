@@ -56,18 +56,18 @@ def test_summary_top_three_total_includes_other_models_and_period_persistence(qa
     panel.show()
     report = tp.demo_report()
     panel.apply_report(report)
-    assert panel.total.text() == "4.07M Token"
-    assert panel.cost.text() == "API 等值 約 US$7.61"
+    assert panel.total.text() == "4.07M"
+    assert panel.cost.text() == "US$7.61"
     assert "89 / 89" in panel.cost.toolTip()
     assert panel.more.text() == "另有 1 組"
     assert len([r for r, _, _ in panel.rows if not r.isHidden()]) == 3
     panel.period.setCurrentIndex(panel.period.findData("week"))
     assert panel.total.text() == "讀取中…"
-    assert panel.cost.text() == "API 等值（USD） 讀取中…"
+    assert panel.cost.text() == "讀取中…"
     panel.apply_report(report)
     assert panel.total.text() == "讀取中…"  # late result from a previous selection
     panel.apply_report(replace(report, period="week", total_tokens=123456))
-    assert panel.total.text() == "123.5K Token"
+    assert panel.total.text() == "123.5K"
     recreated = tp.TokenUsagePanel(QSettings(path, QSettings.Format.IniFormat), app.DIALOG_STYLE)
     assert recreated.period.currentData() == "week"
     panel.close()
@@ -379,7 +379,7 @@ def test_partial_and_unknown_costs_are_explicit_and_reset_with_period(widget):
     unknown = replace(report.groups[0], model="unknown", api_cost_usd=0, priced_responses=0)
     panel.apply_report(replace(report, groups=(unknown, *report.groups[1:])))
     panel.open_details()
-    assert "部分" in panel.cost.text()
+    assert "部分" in panel.cost_caption.text()
     assert "部分" in panel.dialog.cost_hint.text()
     assert panel.dialog.groups.item(0, 8).text() == "無法估算"
     assert "未涵蓋部分不視為零" in panel.dialog.metrics[3].toolTip()

@@ -54,7 +54,7 @@ from quota_summary import QuotaSummaryCard, QuotaSummaryRow
 
 
 APP_NAME = "Quota PromptDock"
-APP_VERSION = "1.4.9"
+APP_VERSION = "1.4.10"
 UI_SCALE_SETTING = "ui_scale_percent"
 UI_SCALE_CHOICES = (75, 90, 100, 110, 125, 150)
 TAIWAN_TZ = timezone(timedelta(hours=8))

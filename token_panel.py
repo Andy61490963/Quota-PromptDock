@@ -278,13 +278,19 @@ class TokenUsagePanel(QFrame):
             #tokenCard { background: #121F30; border: 1px solid #31485B; border-radius: 14px; }
             #tokenCard QLabel { border: 0; background: transparent; color: #CBD5E1; font-size: 12px; }
             #tokenCard #tokenTitle { color: #F8FAFC; font-size: 13px; font-weight: 700; }
-            #tokenCard #tokenTotal { color: #86EDC5; font-size: 25px; font-weight: 700; padding: 3px 0; }
-            #tokenCard #tokenCost { color: #B8DACF; font-size: 13px; padding-bottom: 3px; }
+            #tokenCard #tokenTotal { color: #86EDC5; font-size: 28px; font-weight: 700; }
+            #tokenCard #tokenCost { color: #F0F6FA; font-size: 19px; font-weight: 600; }
+            #tokenCard #metricCaption { color: #A4B8C9; font-size: 11px; }
+            #tokenCard #metricCaption[tone="warning"] { color: #F0C879; }
+            #tokenCard #metricHint { color: #8CA6BC; font-size: 11px; }
+            #tokenCard #modelSeparator { background: #2A3D50; border: 0; }
             #tokenCard #effortBadge { color: #A5C7ED; background: #203249; border-radius: 4px;
                 padding: 1px 5px; font-size: 10px; }
             #tokenCard QProgressBar { border: 0; border-radius: 1px; background: #243247; }
             #tokenCard QProgressBar::chunk { background: #5EBF9A; border-radius: 1px; }
             #tokenCard #tokenStatus { color: #94A3B8; font-size: 11px; }
+            #tokenCard #tokenStatus[tone="warning"], #tokenCard #metricHint[tone="warning"] { color: #F0C879; }
+            #tokenCard #tokenStatus[tone="error"] { color: #FFB0AA; }
             #tokenCard QComboBox { background: #1B2D41; color: #E2E8F0; border: 1px solid #385169;
                 border-radius: 7px; min-height: 28px; max-height: 28px; padding: 0 26px 0 10px; font-size: 12px; }
             #tokenCard QComboBox:hover { background: #23394F; border-color: #52718A; }
@@ -299,8 +305,8 @@ class TokenUsagePanel(QFrame):
             #tokenCard QPushButton:focus, #tokenCard QComboBox:focus { border: 1px solid #70E5B1; }
         """)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 9, 12, 8)
-        layout.setSpacing(4)
+        layout.setContentsMargins(14, 11, 14, 10)
+        layout.setSpacing(9)
         header = QHBoxLayout()
         title = QLabel("Codex Token 用量")
         title.setObjectName("tokenTitle")
@@ -316,18 +322,47 @@ class TokenUsagePanel(QFrame):
         self.period.currentIndexChanged.connect(self._change_period)
         header.addWidget(self.period)
         layout.addLayout(header)
-        self.total = OdometerLabel("— Token")
+        metrics = QHBoxLayout()
+        metrics.setSpacing(14)
+        total_column, cost_column = QVBoxLayout(), QVBoxLayout()
+        for column in (total_column, cost_column):
+            column.setSpacing(3)
+        for text, column, alignment in (("累計 Token", total_column, Qt.AlignmentFlag.AlignLeft),
+                                         ("API 等值估算", cost_column, Qt.AlignmentFlag.AlignRight)):
+            caption = QLabel(text)
+            caption.setObjectName("metricCaption")
+            caption.setAlignment(alignment)
+            column.addWidget(caption)
+            if column is cost_column:
+                self.cost_caption = caption
+        self.total = OdometerLabel("—")
         self.total.setObjectName("tokenTotal")
-        layout.addWidget(self.total)
-        self.cost = OdometerLabel("API 等值（USD） —")
+        self.total.setMinimumWidth(0)
+        total_column.addWidget(self.total)
+        self.response_count = OdometerLabel("等待讀取")
+        self.response_count.setObjectName("metricHint")
+        total_column.addWidget(self.response_count)
+        self.cost = OdometerLabel("—")
         self.cost.setObjectName("tokenCost")
+        self.cost.setMinimumWidth(0)
+        self.cost.setWordWrap(True)
+        self.cost.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.cost.setAccessibleName("API 等值費用，美元估算")
-        layout.addWidget(self.cost)
+        cost_column.addWidget(self.cost, 1)
         self.price_status = ElidedLabel()
-        self.price_status.set_full_text("價格：內建價格")
-        self.price_status.setObjectName("tokenStatus")
+        self.price_status.set_full_text("內建價格 · 待同步")
+        self.price_status.setObjectName("metricHint")
+        self.price_status.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.price_status.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(self.price_status)
+        cost_column.addWidget(self.price_status)
+        metrics.addLayout(total_column, 1)
+        metrics.addLayout(cost_column, 1)
+        layout.addLayout(metrics)
+        self.model_separator = QFrame()
+        self.model_separator.setObjectName("modelSeparator")
+        self.model_separator.setFixedHeight(1)
+        self.model_separator.hide()
+        layout.addWidget(self.model_separator)
         self.rows = []
         self.row_details = []
         for _ in range(3):
@@ -354,18 +389,23 @@ class TokenUsagePanel(QFrame):
             self.rows.append((row, name, value))
             row.hide()
         footer = QHBoxLayout()
+        footer_info = QVBoxLayout()
+        footer_info.setSpacing(2)
+        self.status = OdometerLabel("本機紀錄 · 準備讀取")
+        self.status.setObjectName("tokenStatus")
+        footer_info.addWidget(self.status)
         self.more = OdometerLabel()
-        footer.addWidget(self.more, 1)
-        self.details = QPushButton("查看全部  ›")
+        self.more.setObjectName("tokenStatus")
+        self.more.hide()
+        footer_info.addWidget(self.more)
+        footer.addLayout(footer_info, 1)
+        self.details = QPushButton("查看明細  ›")
         self.details.setFixedSize(96, 30)
         self.details.setCursor(Qt.CursorShape.PointingHandCursor)
         self.details.setAccessibleName("查看全部模型與強度的 Token 用量")
         self.details.clicked.connect(self.open_details)
         footer.addWidget(self.details)
         layout.addLayout(footer)
-        self.status = OdometerLabel("本機已記錄用量 · 準備讀取")
-        self.status.setObjectName("tokenStatus")
-        layout.addWidget(self.status)
 
     def attach_service(self, service):
         self.service = service
@@ -379,11 +419,22 @@ class TokenUsagePanel(QFrame):
         self.settings.sync()
         # Do not label a previous period's totals as the newly selected period.
         self.total.setText("讀取中…")
-        self.cost.setText("API 等值（USD） 讀取中…")
+        self.total.setAccessibleName("正在讀取 Token 用量")
+        self.response_count.setText("等待讀取")
+        self.cost_caption.setText("API 等值估算")
+        self.cost_caption.setToolTip("")
+        self._set_tone(self.cost_caption, "")
+        self.cost.setText("讀取中…")
         self.cost.setToolTip("")
+        self.cost.setAccessibleDescription("")
+        self.price_status.set_full_text("等待價格資料")
+        self.price_status.setToolTip("")
+        self._set_tone(self.price_status, "")
+        self.model_separator.hide()
         for row, _, _ in self.rows:
             row.hide()
         self.more.setText("")
+        self.more.hide()
         if self.dialog:
             self.dialog.begin_period(self.period.currentData())
         self.period_changed.emit(self.period.currentData())
@@ -398,11 +449,26 @@ class TokenUsagePanel(QFrame):
             return
         self.report = report
         self._error = ""
-        self.total.setText(f"{compact_tokens(report.total_tokens)} Token" if report.first_at is not None else "— Token")
+        self.total.setText(compact_tokens(report.total_tokens) if report.first_at is not None else "—")
+        self.total.setAccessibleName(f"累計 {report.total_tokens:,} Token" if report.first_at is not None else "尚無 Token 紀錄")
         self.total.setToolTip(f"{report.total_tokens:,} Token · {report.responses:,} 次回應")
-        self.cost.setText("API 等值 " + format_cost(report.api_cost_usd, report.priced_responses, report.responses))
+        self.response_count.setText(f"{report.responses:,} 次回應")
+        partial = 0 < report.priced_responses < report.responses
+        self.cost_caption.setText("API 等值 · 部分估算" if partial else "API 等值估算")
+        self._set_tone(self.cost_caption, "warning" if report.priced_responses < report.responses else "")
+        self.cost.setText(format_cost(report.api_cost_usd, report.priced_responses, report.responses)
+                          .removeprefix("約 ").removesuffix("（部分）"))
         detail = pricing_description(report.api_cost_usd, report.priced_responses, report.responses, report.pricing_note)
-        self.price_status.set_full_text("價格：" + (report.pricing_note.split("\n")[0] if report.pricing_note else "內建價格"))
+        self.cost_caption.setToolTip(detail)
+        source = report.pricing_note.split("\n")[0]
+        if "同步失敗" in source:
+            price_text = "同步失敗 · " + ("沿用快取" if "官方價格" in source else "內建價格")
+        elif source.startswith("官方價格 · "):
+            price_text = "官方價格 · " + source.removesuffix(" 已同步").rsplit(" ", 1)[-1]
+        else:
+            price_text = "內建價格 · 待同步"
+        self.price_status.set_full_text(price_text)
+        self._set_tone(self.price_status, "warning" if "同步失敗" in source else "")
         self.price_status.setToolTip(detail)
         self.cost.setToolTip(detail)
         self.cost.setAccessibleDescription(detail)
@@ -415,12 +481,15 @@ class TokenUsagePanel(QFrame):
                 badge, bar = self.row_details[index]
                 badge.setText(group.effort.title() or "未知")
                 badge.setToolTip(group_name(group))
+                bar.setVisible(len(report.groups) > 1)
                 bar.setValue(round(group.total_tokens / report.total_tokens * 1000) if report.total_tokens else 0)
                 bar.setToolTip(f"占區間總用量 {group.total_tokens / report.total_tokens:.1%}" if report.total_tokens else "尚無用量")
                 value.setText(compact_tokens(group.total_tokens))
                 value.setToolTip(f"{group.total_tokens:,} Token")
         extra = max(0, len(report.groups) - self.row_limit)
-        self.more.setText(f"另有 {extra} 組" if extra else (f"{len(report.groups)} 個組合" if report.groups else "此區間無用量"))
+        self.more.setText(f"另有 {extra} 組" if extra else f"{len(report.groups)} 個組合")
+        self.more.setVisible(extra > 0 or len(report.groups) > 1)
+        self.model_separator.setVisible(bool(report.groups) and self.row_limit > 0)
         self._render_status()
         if self.dialog and self.dialog.isVisible():
             self.dialog.apply_report(report)
@@ -446,27 +515,40 @@ class TokenUsagePanel(QFrame):
         self._render_status()
 
     def _render_status(self):
+        tone = ""
         if self.is_demo:
             self.status.setText("示範資料 · 非實際用量")
             self.status.setToolTip("僅展示介面，不讀取或寫入 Token 資料庫。")
             return
-        text = "本機已記錄用量"
+        text = "本機紀錄"
         if self._error:
             text += " · 更新失敗，稍後重試"
+            tone = "error"
         elif self._busy is not None:
             text += f" · 匯入中 {self._busy[0]}/{self._busy[1]}"
         elif self.report and self.report.issues.get("read_errors"):
             text += " · 部分檔案讀取失敗"
+            tone = "warning"
         elif self.report and any(self.report.issues.values()):
             text += " · 統計不完整"
+            tone = "warning"
         elif self.report and not self.report.responses:
             text += " · 尚無此區間紀錄"
         elif self.report:
             text += " · " + datetime.fromtimestamp(self.report.updated_at, TAIWAN_TZ).strftime("%H:%M 更新")
         self.status.setText(text)
+        self._set_tone(self.status, tone)
         detail = self._error or (coverage_text(self.report) if self.report else "等待讀取 Codex 本機紀錄。")
         self.status.setToolTip(detail)
         self.status.setAccessibleDescription(detail)
+
+    @staticmethod
+    def _set_tone(label, tone):
+        if label.property("tone") != tone:
+            label.setProperty("tone", tone)
+            label.style().unpolish(label)
+            label.style().polish(label)
+            label.update()
 
     def open_details(self):
         if self.dialog is None:

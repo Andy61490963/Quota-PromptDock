@@ -2,9 +2,11 @@
 
 Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude Code 剩餘額度、依模型與推理強度追蹤 Codex 本機 Token 用量，並將常用指令一鍵貼到目前使用的 AI 工具。
 
-**目前正式版：v1.4.9** · Windows x64 · 繁體中文 · 不需安裝 Python
+**目前正式版：v1.4.10** · Windows x64 · 繁體中文 · 不需安裝 Python
 
-[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.9 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.9) · [驗證紀錄](驗證紀錄.md)
+[下載最新版本](https://github.com/Andy61490963/Quota-PromptDock/releases/latest) · [v1.4.10 更新說明](https://github.com/Andy61490963/Quota-PromptDock/releases/tag/v1.4.10) · [驗證紀錄](驗證紀錄.md)
+
+**v1.4.10**：Token 小卡改為用量／API 等值費用雙欄，顯示回應次數與精簡價格同步時間；單一模型省略滿格長條，統計缺漏與同步失敗使用醒目提示。詳見[版本說明](docs/發布說明-v1.4.10.md)。
 
 **v1.4.9**：背景自動同步 OpenAI 官方模型價格，新模型無須逐次補價與發布；支援離線快取、價格同步時間，以及主畫面左上角版本號。詳見[版本說明](docs/發布說明-v1.4.9.md)。
 
@@ -47,7 +49,7 @@ Windows 桌面上的 AI 額度與常用指令小工具。查看 Codex／Claude C
 .\QuotaDock-Windows-x64.exe --install
 ```
 
-安裝位置為 `%LOCALAPPDATA%\Programs\QuotaDock\QuotaDock.exe`。升級會沿用既有設定、常用指令及 Token 資料庫。
+安裝位置為 `%LOCALAPPDATA%\Programs\QuotaDock\versions\<版本與識別碼>\QuotaDock.exe`，目前版本由根目錄的 `current.json` 記錄，桌面捷徑直接指向使用中的版本。升級會沿用既有設定、常用指令及 Token 資料庫。
 
 v1.4.5 的自動更新會依 GitHub 版本附件資訊核對下載大小與 SHA-256，先完成暫存才關閉舊程式。安裝後會等待新版主視窗進入事件迴圈；失敗時嘗試還原程式、桌面捷徑與開機設定，安裝目錄保留上一版 `QuotaDock.exe.bak`。這是下載完整性校驗，並非 Windows 程式碼簽章。
 
@@ -254,7 +256,7 @@ Remove-Item Env:QT_QPA_PLATFORM
 
 更新 `APP_VERSION` 並通過測試後，提交程式碼、建立對應的 `v*` 標籤並推送。預設分支為 `mainer`，發布流程在 [`.github/workflows/release.yml`](.github/workflows/release.yml)。
 
-GitHub Actions 會安裝固定依賴、測試、打包，並上傳 `QuotaDock-Windows-x64.exe`。若已有草稿 Release，執行檔會上傳至草稿，仍需檢查後手動公開；若沒有 Release，流程會建立正式版。工作流程也支援手動執行，但必須選擇 `v*` 標籤。
+GitHub Actions 會安裝固定依賴、測試、打包，並以真正的前一正式版 EXE 驗證鎖檔升級與失敗回復，再建立或更新草稿 Release，附上執行檔、授權與校驗碼。檢查完成後才正式公開，不覆寫已公開版本的附件。工作流程也支援手動執行，但必須選擇 `v*` 標籤。
 
 正式公開前確認版本號、發布說明、執行檔與下載測試，並附上原始碼、第三方授權及校驗碼。
 
